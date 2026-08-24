@@ -316,6 +316,63 @@ def _aa_report(hs, *, sla_value, date_mode, owner_checks, exclude_admin, total_t
     return counts
 
 
+# ── Account Services "Tickets Outside SLA" — report 5b (segment-driven snapshot) ────────
+_AA_COMPLETED_STAGE = "154789384"  # "Completed (Account Administration)" stage
+
+# 5b outside-SLA segments (HubSpot active lists), matched case-insensitively by keyword.
+_5B_SEGMENTS = {
+    "enhanced_review":      ["outside sla", "enhanced review", "account administration"],
+    "pending_action":       ["outside sla", "pending action", "account administration"],
+    "transmitted":          ["outside sla", "transmitted", "account administration"],
+    "pending_confirmation": ["outside sla", "pending confirmation", "account administration"],
+}
+
+
+def _acct_services_outside_5b(hs):
+    """Report 5b — Account Administration tickets currently Outside SLA.
+
+    Report filter: (1 AND 2) OR (1 AND 3 AND 4)
+      1 = request_type IN AA types  AND  stage != 'Completed (Account Administration)'
+      2 = member of Outside-SLA segment {Enhanced Review | Pending Action | Transmitted}
+      3 = NBIN Follow Up SLA > 15, where
+          NBIN Follow Up SLA = DATEDIFF(MINUTE, notification_sent_to_assignee, sent_to_nbin__date__time)
+      4 = member of Outside-SLA segment {Pending Confirmation}
+    Live snapshot (no date window). Grouped per person by 'Assigned to' (assigned_to)."""
+    seg = {}
+    for key, kw in _5B_SEGMENTS.items():
+        lid = _find_list_id(hs, kw)
+        seg[key] = set(str(x) for x in hs.list_members(lid)) if lid else set()
+    branch2 = seg["enhanced_review"] | seg["pending_action"] | seg["transmitted"]
+    branch4 = seg["pending_confirmation"]
+    cand = branch2 | branch4
+    if not cand:
+        return {}
+    props = hs.batch_read(list(cand),
+                          ["request_type", "hs_pipeline_stage", "assigned_to",
+                           "notification_sent_to_assignee", "sent_to_nbin__date__time"])
+    id_to_name, _ = hs.owner_maps()
+    counts = {}
+    for tid, p in props.items():
+        tid = str(tid)
+        # clause 1
+        if p.get("request_type") not in _ACCT_ADMIN_REQ_TYPES:
+            continue
+        if str(p.get("hs_pipeline_stage")) == _AA_COMPLETED_STAGE:
+            continue
+        # clause 3: NBIN Follow Up SLA (minutes) > 15
+        a = to_ms(p.get("notification_sent_to_assignee"))
+        b = to_ms(p.get("sent_to_nbin__date__time"))
+        c3 = (a is not None and b is not None and int((b - a) / 60000) > 15)
+        # (1 AND 2) OR (1 AND 3 AND 4)  — clause 1 already enforced above
+        if (tid in branch2) or (c3 and tid in branch4):
+            attr = p.get("assigned_to")
+            if not attr:
+                continue
+            nm = id_to_name.get(str(attr), str(attr))
+            counts[nm] = counts.get(nm, 0) + 1
+    return counts
+
+
 def _account_services(hs):
     OWNER = "hubspot_owner_id"; PM = "portfolio_manager"; SPM = "supervising_portfolio_manager"
     within = _aa_report(hs, sla_value="Within SLA", date_mode="today", owner_checks=[OWNER],
@@ -326,10 +383,7 @@ def _account_services(hs):
                          exclude_admin=True, total_time_clause=True,
                          segment_keywords=["account opening completed today", "outside"],
                          nbin_branch=False, attribution_field="assigned_to_outside_sla")           # 5e
-    open_outside = _aa_report(hs, sla_value="Outside SLA", date_mode="8days", owner_checks=[OWNER, PM, SPM],
-                              exclude_admin=True, total_time_clause=True,
-                              segment_keywords=None, nbin_branch=True,
-                              attribution_field="assigned_to_outside_sla")                          # 5c
+    open_outside = _acct_services_outside_5b(hs)                                                    # 5b
     names = sorted(set(within) | set(outside) | set(open_outside))
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]
     total = ["Total", sum(within.values()), sum(outside.values()), sum(open_outside.values())]

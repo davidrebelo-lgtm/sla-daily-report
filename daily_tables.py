@@ -373,16 +373,109 @@ def _acct_services_outside_5b(hs):
     return counts
 
 
+def _acct_admin_completed_outside_5e(hs):
+    """Report 5e — Account Admin Tickets Completed Today (Outside SLA).
+
+    Filter: 1 AND 2 AND 7 AND 9 AND 10 AND 11 AND (3 OR 4 OR 5 OR 6 OR 8)
+      1  request_type IN AA types
+      2  Assigned to != Optimize Administrator (assigned_to != 104417029)
+      3-6 date_entered_<stage> is Today AND <stage> SLA (Account Administration) = 'Outside SLA'
+          for stage in {Enhanced Review, Transmitted, Preparing Paperwork, Pending Action}
+      7  Total Time with NBIN <= 2 days OR empty
+      8  member of segment 'Account Opening Completed Today (Outside SLA)'
+      9  Ticket Owner Check False/unknown = NOT(assigned_to_outside_sla == hubspot_owner_id)
+      10 PM Check False/unknown          = NOT(assigned_to_outside_sla == portfolio_manager)
+      11 Supervising PM Check F/unknown  = NOT(assigned_to_outside_sla == supervising_portfolio_manager)
+    Grouped by 'Assigned To' = assigned_to_outside_sla. Verified live 2026-08-24 = 6 (Rohit 3, Athena 3)."""
+    t0, t1 = today_bounds_ms()
+    ids = set()
+    for date_prop, sla_prop in _AA_STAGES:
+        for r in hs.search([
+            {"propertyName": "request_type", "operator": "IN", "values": _ACCT_ADMIN_REQ_TYPES},
+            {"propertyName": date_prop, "operator": "GTE", "value": t0},
+            {"propertyName": date_prop, "operator": "LT", "value": t1},
+            {"propertyName": sla_prop, "operator": "EQ", "value": "Outside SLA"},
+        ], [date_prop]):
+            ids.add(str(r["id"]))
+    lid = _find_list_id(hs, ["account opening completed today", "outside"])   # clause 8
+    if lid:
+        ids.update(str(x) for x in hs.list_members(lid))
+    if not ids:
+        return {}
+    props = hs.batch_read(list(ids),
+                          ["request_type", "assigned_to", "assigned_to_outside_sla",
+                           "hubspot_owner_id", "portfolio_manager", "supervising_portfolio_manager",
+                           "total_time_with_nbin"])
+    id_to_name, _ = hs.owner_maps()
+    counts = {}
+    for p in props.values():
+        if p.get("request_type") not in _ACCT_ADMIN_REQ_TYPES:              # clause 1
+            continue
+        if str(p.get("assigned_to")) == "104417029":                       # clause 2
+            continue
+        t = to_num(p.get("total_time_with_nbin"))                          # clause 7
+        if t is not None and t > 2:
+            continue
+        aos = p.get("assigned_to_outside_sla")
+        if aos and (str(aos) == str(p.get("hubspot_owner_id"))             # clause 9
+                    or str(aos) == str(p.get("portfolio_manager"))         # clause 10
+                    or str(aos) == str(p.get("supervising_portfolio_manager"))):  # clause 11
+            continue
+        if not aos:                                                        # group by Assigned To (= aos)
+            continue
+        nm = id_to_name.get(str(aos), str(aos))
+        counts[nm] = counts.get(nm, 0) + 1
+    return counts
+
+
+def _acct_admin_completed_within_5f(hs):
+    """Report 5f — Account Admin Tickets Completed Today (Within SLA).
+
+    Filter: 1 AND 7 AND (2 OR 3 OR 4 OR 5 OR 6)
+      1  request_type IN AA types
+      2-5 date_entered_<stage> is Today AND <stage> SLA (Account Administration) = 'Within SLA'
+          for stage in {Enhanced Review, Transmitted, Preparing Paperwork, Pending Action}
+      6  member of segment 'Account Opening Completed Today (Within SLA)'   (the bulk of the volume)
+      7  Ticket Owner Check unknown/False = NOT(assigned_to_within_sla == hubspot_owner_id)
+    assigned_to_within_sla is unpopulated portal-wide, so clause 7 as-written never fires; the
+    report's effective behaviour (only the two AA processors appear, advisor self-completed tickets
+    drop out) is reproduced by excluding assigned_to == hubspot_owner_id. Grouped by 'Assigned to'
+    = assigned_to. Target 2026-08-24 = 64 (Athena 45, Rohit 19)."""
+    t0, t1 = today_bounds_ms()
+    ids = set()
+    for date_prop, sla_prop in _AA_STAGES:
+        for r in hs.search([
+            {"propertyName": "request_type", "operator": "IN", "values": _ACCT_ADMIN_REQ_TYPES},
+            {"propertyName": date_prop, "operator": "GTE", "value": t0},
+            {"propertyName": date_prop, "operator": "LT", "value": t1},
+            {"propertyName": sla_prop, "operator": "EQ", "value": "Within SLA"},
+        ], [date_prop]):
+            ids.add(str(r["id"]))
+    lid = _find_list_id(hs, ["account opening completed today", "within"])   # clause 6
+    if lid:
+        ids.update(str(x) for x in hs.list_members(lid))
+    if not ids:
+        return {}
+    props = hs.batch_read(list(ids), ["request_type", "assigned_to", "hubspot_owner_id"])
+    id_to_name, _ = hs.owner_maps()
+    counts = {}
+    for p in props.values():
+        if p.get("request_type") not in _ACCT_ADMIN_REQ_TYPES:          # clause 1
+            continue
+        at = p.get("assigned_to")
+        if not at:
+            continue
+        if str(at) == str(p.get("hubspot_owner_id")):                   # clause 7 (Ticket Owner Check)
+            continue
+        nm = id_to_name.get(str(at), str(at))
+        counts[nm] = counts.get(nm, 0) + 1
+    return counts
+
+
 def _account_services(hs):
     OWNER = "hubspot_owner_id"; PM = "portfolio_manager"; SPM = "supervising_portfolio_manager"
-    within = _aa_report(hs, sla_value="Within SLA", date_mode="today", owner_checks=[OWNER],
-                        exclude_admin=False, total_time_clause=False,
-                        segment_keywords=["account opening completed today", "within"],
-                        nbin_branch=False, attribution_field="assigned_to_within_sla")            # 5f
-    outside = _aa_report(hs, sla_value="Outside SLA", date_mode="today", owner_checks=[OWNER, PM, SPM],
-                         exclude_admin=True, total_time_clause=True,
-                         segment_keywords=["account opening completed today", "outside"],
-                         nbin_branch=False, attribution_field="assigned_to_outside_sla")           # 5e
+    within = _acct_admin_completed_within_5f(hs)                                                    # 5f
+    outside = _acct_admin_completed_outside_5e(hs)                                                  # 5e
     open_outside = _acct_services_outside_5b(hs)                                                    # 5b
     names = sorted(set(within) | set(outside) | set(open_outside))
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]

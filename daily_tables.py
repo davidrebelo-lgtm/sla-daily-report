@@ -13,7 +13,12 @@ import reports
 from hubspot_client import to_ms, to_num, today_bounds_ms, TZ
 
 # Test/demo owners to exclude from every people table (they aren't real reps).
-_EXCLUDE_NAMES = {"Transition Demo"}
+_EXCLUDE_NAMES = {"Transition Demo", "Optimize Administrator"}   # dropped from every people table
+# Extra per-section exclusions (by table title)
+_EXCLUDE_BY_TITLE = {
+    "Client Service Dashboard": {"Rohit Kapoor"},
+    "Transfers (Pending Review)": {"Rohit Kapoor", "Srijan Ahuja"},
+}
 
 
 # ── Client Service Dashboard: 4b "Tickets Outside SLA" (full dataset tree) ──────────────
@@ -34,6 +39,9 @@ _4B_FIELDS = ["action_item", "hs_pipeline", "hs_pipeline_stage", "note_status", 
               "associate_portfolio_manager", "supervising_portfolio_manager", "request_type",
               "action_item_sla", "assigned_to_outside_sla", "sent_to_nbin__date__time",
               "date_entered_in_process_support_ticket"]
+_4B_NBIN_FIELDS = _4B_FIELDS + ["received_response_from_nbin"]   # + "Completed by NBIN" for 6f
+# Pipelines whose "Completed" stage feeds report 6e (note: New Accounts excluded, Transfer Out included)
+_6E_PIPELINE_NAMES = {"Transfer Out", "Transfer", "Add Funds", "Withdraw", "Plans"}
 
 
 def _days_ago_edt_midnight(days):
@@ -54,11 +62,11 @@ def _cs_label_maps(hs):
     return pl, st
 
 
-def _4b_outside(hs):
-    """Report 4b — Client Service tickets currently Outside SLA (12-clause dataset tree)."""
+def _4b_kept_props(hs, fields):
+    """Ticket property-dicts passing the report-4b outside-SLA predicate (deduped, both branches).
+    Shared by 4b (Client Service Dashboard) and 6f (Client Service NBIN)."""
     now_ms = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1000)
     pl_label, st_label = _cs_label_maps(hs)
-    id_to_name, _ = hs.owner_maps()
 
     def has(text, subs):
         t = text or ""
@@ -124,7 +132,7 @@ def _4b_outside(hs):
             return False
         return True
 
-    counts, seen = {}, set()
+    kept, seen = [], set()
 
     def process(rows):
         for p in rows:
@@ -133,18 +141,27 @@ def _4b_outside(hs):
                 continue
             seen.add(tid)
             if keep(p):
-                attr = p.get("assigned_to")
-                if attr:
-                    nm = id_to_name.get(str(attr), str(attr))
-                    counts[nm] = counts.get(nm, 0) + 1
+                kept.append(p)
 
     process(hs.search([{"propertyName": "hs_pipeline", "operator": "IN", "values": _CS_PIPELINES},
                        {"propertyName": "sla_due_date", "operator": "LT", "value": now_ms},
-                       {"propertyName": "sla_due_date", "operator": "HAS_PROPERTY"}], _4B_FIELDS))
+                       {"propertyName": "sla_due_date", "operator": "HAS_PROPERTY"}], fields))
     process(hs.search([{"propertyName": "request_type", "operator": "IN",
                         "values": ["Cancel / Correct", "Residual Transfer-In Sweep"]},
                        {"propertyName": "hs_pipeline", "operator": "IN", "values": _CS_PIPELINES}],
-                      _4B_FIELDS))
+                      fields))
+    return kept
+
+
+def _4b_outside(hs):
+    """Report 4b — Client Service tickets currently Outside SLA, per assigned_to."""
+    id_to_name, _ = hs.owner_maps()
+    counts = {}
+    for p in _4b_kept_props(hs, _4B_FIELDS):
+        attr = p.get("assigned_to")
+        if attr:
+            nm = id_to_name.get(str(attr), str(attr))
+            counts[nm] = counts.get(nm, 0) + 1
     return counts
 
 
@@ -507,7 +524,43 @@ def _account_admin_nbin(hs):
         {"propertyName": "hs_pipeline_stage", "operator": "NEQ", "value": "154789384"},
     ], ["request_type"]))
     return {"title": "Account Administration Tickets with NBIN",
-            "columns": ["Tickets With NBIN", "Completed Outside SLA"],
+            "columns": ["Tickets With NBIN", "Completed Outside SLA Last 7 Days"],
+            "flat_row": [with_nbin, outside]}
+
+
+def _cs_completed_stage_ids(hs):
+    """Stage ids labelled 'Completed' in the report-6e pipelines (resolved by pipeline name)."""
+    data = hs._req("GET", "/crm/v3/pipelines/tickets").get("results", [])
+    out = []
+    for p in data:
+        if (p.get("label") or "") in _6E_PIPELINE_NAMES:
+            for s in p.get("stages", []):
+                if (s.get("label") or "").strip() == "Completed":
+                    out.append(str(s.get("id")))
+    return out
+
+
+def _client_service_nbin(hs):
+    """Client Service Tickets with NBIN:  6e 'Tickets With NBIN' | 6f 'Completed Outside SLA Last 7 Days'."""
+    # 6e — closed < 8 days ago (EDT), in the 6e pipelines' Completed stage, AND
+    #      (Total Time with NBIN > 2 days  OR  Notification Sent to Assignee is known)
+    lo = _days_ago_edt_midnight(8)
+    stages = _cs_completed_stage_ids(hs)
+    with_nbin = 0
+    if stages:
+        base = [{"propertyName": "closed_date", "operator": "GTE", "value": lo},
+                {"propertyName": "hs_pipeline_stage", "operator": "IN", "values": stages}]
+        groups = [{"filters": base + [{"propertyName": "total_time_with_nbin", "operator": "GT", "value": "2"}]},
+                  {"filters": base + [{"propertyName": "notification_sent_to_assignee", "operator": "HAS_PROPERTY"}]}]
+        with_nbin = len({r["id"] for r in hs.search_groups(groups, ["request_type"])})
+    # 6f — the 4b outside-SLA tickets that are still with NBIN
+    #      (Sent to NBIN known AND Completed by NBIN unknown)
+    outside = 0
+    for p in _4b_kept_props(hs, _4B_NBIN_FIELDS):
+        if p.get("sent_to_nbin__date__time") and not p.get("received_response_from_nbin"):
+            outside += 1
+    return {"title": "Client Service Tickets with NBIN",
+            "columns": ["Tickets With NBIN", "Completed Outside SLA Last 7 Days"],
             "flat_row": [with_nbin, outside]}
 
 
@@ -549,18 +602,59 @@ def _people_tbl(title, w, o, oo, cols):
             "total": ["Total", sum(w.values()), sum(o.values()), sum(oo.values())]}
 
 
+_2B_ASSIGNEES = {"Batuhan Karabay", "Christian Alvarez", "Ryan Connon", "Shivani Shaurya",
+                 "Phil Kolanowski", "Andrew Kirkham", "Ali Vahedi", "Adam Goldband", "Gabriel Tan"}
+_2B_OWNER_EXCLUDE = {"Stephanie Hunter", "Daniel Willett"}
+
+
+def _advisor_open_pending_action_2b(hs):
+    """Report 2b — Advisor Support Pending Action tickets currently Outside SLA.
+
+    Members of segment 'Outside SLA - Pending Action (Support Tickets)' AND:
+      2  pipeline Support Ticket, stage != Closed
+      3  owner not Stephanie Hunter / Daniel Willett (empty owner OK); submitted_by not Daniel Willett
+      4  Assigned to in the Advisor Support roster
+      5  Ticket Opened After 5:30 is before yesterday, or unknown
+    Grouped by Assigned to (assigned_to). The bare segment count previously counted tickets the
+    report excludes (e.g. a ticket owned by Daniel Willett) — this applies the full 2b filter."""
+    seg = hs.sla_segments().get("Pending Action")
+    if not seg:
+        return {}
+    _, closed = hs.support_ids()
+    id_to_name, _ = hs.owner_maps()
+    yest = _dt.datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0) - _dt.timedelta(days=1)
+    yest_ms = int(yest.astimezone(_dt.timezone.utc).timestamp() * 1000)
+    props = hs.batch_read(hs.list_members(seg),
+                          ["action_item", "hs_pipeline_stage", "assigned_to", "hubspot_owner_id",
+                           "request_submitted_by", "ticket_opened_after_530"])
+    counts = {}
+    for p in props.values():
+        if p.get("action_item") != "Pending Action":                          # filter 1
+            continue
+        if str(p.get("hs_pipeline_stage")) == str(closed):                     # filter 2
+            continue
+        owner = p.get("hubspot_owner_id")
+        if owner and id_to_name.get(str(owner)) in _2B_OWNER_EXCLUDE:          # filter 3a
+            continue
+        if "daniel willett" in (p.get("request_submitted_by") or "").lower():  # filter 3b
+            continue
+        a = p.get("assigned_to")
+        if not a:
+            continue
+        nm = id_to_name.get(str(a), str(a))
+        if nm not in _2B_ASSIGNEES:                                            # filter 4
+            continue
+        oa = to_ms(p.get("ticket_opened_after_530"))                          # filter 5
+        if oa is not None and oa >= yest_ms:
+            continue
+        counts[nm] = counts.get(nm, 0) + 1
+    return counts
+
+
 def _advisor_pending_action(hs):
     w_pa = reports._sum_per_person(hs, [reports._today_pending_action(hs, True)])
     o_pa = reports._sum_per_person(hs, [reports._today_pending_action(hs, False)])
-    open_pa = {}
-    seg = hs.sla_segments().get("Pending Action")
-    if seg:
-        id_to_name, _ = hs.owner_maps()
-        for p in hs.batch_read(hs.list_members(seg), [reports.P["assigned_to_processing"]]).values():
-            oid = p.get(reports.P["assigned_to_processing"])
-            if oid:
-                nm = id_to_name.get(str(oid), str(oid))
-                open_pa[nm] = open_pa.get(nm, 0) + 1
+    open_pa = _advisor_open_pending_action_2b(hs)
     return _people_tbl("Advisor Support (Pending Action) — Daily Stats", w_pa, o_pa, open_pa, _ADVISOR_COLS)
 
 
@@ -579,7 +673,9 @@ def build_tables(hs):
         ("Advisor Support Tickets With NBIN", _advisor_support_nbin,
          ["Actioned Within SLA", "Actioned Outside SLA", "Total Advisor Support Tickets with NBIN"]),
         ("Account Administration Tickets with NBIN", _account_admin_nbin,
-         ["Tickets With NBIN", "Completed Outside SLA"]),
+         ["Tickets With NBIN", "Completed Outside SLA Last 7 Days"]),
+        ("Client Service Tickets with NBIN", _client_service_nbin,
+         ["Tickets With NBIN", "Completed Outside SLA Last 7 Days"]),
         ("Account Services Dashboard", _account_services,
          ["Name", "Completed Within SLA", "Completed Outside SLA", "Tickets Outside SLA"]),
         ("Transfers (Pending Review)", _transfers,
@@ -602,7 +698,8 @@ def build_tables(hs):
         rows = t.get("rows")
         if not rows:
             continue
-        kept = [r for r in rows if str(r[0]) not in _EXCLUDE_NAMES]
+        drop = _EXCLUDE_NAMES | _EXCLUDE_BY_TITLE.get(t.get("title", ""), set())
+        kept = [r for r in rows if str(r[0]) not in drop]
         if len(kept) != len(rows):
             t["rows"] = kept
             ncol = len(t["columns"])

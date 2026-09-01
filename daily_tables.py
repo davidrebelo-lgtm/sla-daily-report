@@ -17,7 +17,8 @@ _EXCLUDE_NAMES = {"Transition Demo", "Optimize Administrator"}   # dropped from 
 # Extra per-section exclusions (by table title)
 _EXCLUDE_BY_TITLE = {
     "Client Service Dashboard": {"Rohit Kapoor"},
-    "Transfers (Pending Review)": {"Rohit Kapoor", "Srijan Ahuja"},
+    "Transfers (Pending Review)": {"Rohit Kapoor", "Srijan Ahuja", "Jay Suba"},
+    "Account Services Dashboard": {"Rashi Tiwari"},
 }
 
 

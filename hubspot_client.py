@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import sys
 import time
 from zoneinfo import ZoneInfo
@@ -20,6 +21,24 @@ import requests
 
 BASE = "https://api.hubapi.com"
 TZ = ZoneInfo("America/Toronto")
+
+# --- test-ticket filter -----------------------------------------------------
+# Test tickets use a fake client name of the form "Client <number>" in the subject:
+# "Client Seven", "Client One", "Miao Client 1", "Khoi Client 3", "Client Fake Seven",
+# "Client Thirty-Four", etc. Real tickets with the word "Client" (e.g. "Client Consent
+# Form", "Credit Client Account", "Client Passed Away") are NOT matched because there
+# "Client" is never followed by a number word/digit. Filtered out of every count.
+_TEST_SUBJECT_RE = re.compile(
+    r"client\s+(fake\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|"
+    r"sixty|seventy|eighty|ninety|hundred)\b", re.I)
+# Test-family "Corp" entities (e.g. "KYC Update - Miao Corp"). Matches only the known test
+# families, so real corporations ("Della Malva ... Professional Corp.", "PCOIT INC") are untouched.
+_TEST_FAMILY_RE = re.compile(r"\b(miao|khoi|nicholas|daric)\s+corp\b", re.I)
+
+
+def is_test_subject(subject) -> bool:
+    return bool(subject and (_TEST_SUBJECT_RE.search(subject) or _TEST_FAMILY_RE.search(subject)))
 
 # --- ticket property internal names (resolved from the schema) --------------
 P = {
@@ -64,6 +83,64 @@ class HubSpot:
         self._owner_cache = None
         self._pipeline_cache = None
         self._seg_cache = None
+        self._test_contact_cache = None
+
+    # -- test-contact filter -------------------------------------------------
+    def test_contact_ids(self):
+        """Contact ids of fake test clients: internal @ofg.com emails tagged '+client'
+        (e.g. khoi.hoang+client3@ofg.com, client2@ofg.com) or last name 'Client <n>'.
+        Cached once per run; best-effort (returns empty on any error so the report never breaks)."""
+        if self._test_contact_cache is not None:
+            return self._test_contact_cache
+        ids = set()
+        try:
+            after = None
+            while True:
+                body = {"filterGroups": [{"filters": [
+                            {"propertyName": "email", "operator": "CONTAINS_TOKEN", "value": "ofg"}]}],
+                        "properties": ["email", "lastname"], "limit": 100,
+                        "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}]}
+                if after:
+                    body["after"] = after
+                data = self._req("POST", "/crm/v3/objects/contacts/search", json=body)
+                for c in data.get("results", []):
+                    p = c.get("properties", {})
+                    email = (p.get("email") or "").lower()
+                    last = (p.get("lastname") or "").strip()
+                    if ("+client" in email or re.match(r"^client\d*@", email)
+                            or re.match(r"^client\s+\d+$", last, re.I)):
+                        ids.add(str(c["id"]))
+                after = data.get("paging", {}).get("next", {}).get("after")
+                if not after or len(ids) > 10000:
+                    break
+        except Exception as e:
+            print(f"[dash][WARN] test_contact_ids failed ({e}); subject filter still applies", file=sys.stderr)
+            return set()
+        self._test_contact_cache = ids
+        return ids
+
+    def _tickets_with_test_contact(self, ids):
+        """Subset of `ids` (ticket ids) associated with a test contact. Best-effort."""
+        test = self.test_contact_ids()
+        if not test or not ids:
+            return set()
+        bad = set()
+        try:
+            sids = [str(x) for x in ids]
+            for i in range(0, len(sids), 100):
+                data = self._req("POST", "/crm/v4/associations/tickets/contacts/batch/read",
+                                 json={"inputs": [{"id": x} for x in sids[i:i + 100]]})
+                for r in data.get("results", []):
+                    frm = str(r.get("from", {}).get("id"))
+                    for a in r.get("to", []):
+                        if str(a.get("toObjectId") or a.get("id") or "") in test:
+                            bad.add(frm)
+                            break
+        except Exception as e:
+            print(f"[dash][WARN] contact-association filter failed ({e}); subject filter still applies",
+                  file=sys.stderr)
+            return set()
+        return bad
 
     def _req(self, method, path, **kw):
         for attempt in range(5):
@@ -135,7 +212,7 @@ class HubSpot:
         cursor is deterministic. We also guard the Search API's hard 10k-result cap
         so silent truncation surfaces in the logs instead of quietly undercounting."""
         out, after, seen = [], None, set()
-        want = list({*props, P["assigned_to"], "hs_object_id"})
+        want = list({*props, P["assigned_to"], "hs_object_id", "subject"})
         while True:
             body = {"filterGroups": filter_groups, "properties": want, "limit": 100,
                     "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}]}
@@ -148,6 +225,8 @@ class HubSpot:
                     continue
                 seen.add(tid)
                 row = dict(t.get("properties", {}))
+                if is_test_subject(row.get("subject")):   # drop test tickets globally
+                    continue
                 row["id"] = tid
                 out.append(row)
             after = data.get("paging", {}).get("next", {}).get("after")
@@ -157,6 +236,9 @@ class HubSpot:
                 print("[dash][WARN] search hit the 10,000-result cap — results "
                       f"truncated; filters={filter_groups}", file=sys.stderr)
                 break
+        bad = self._tickets_with_test_contact([r["id"] for r in out])   # drop test-contact tickets
+        if bad:
+            out = [r for r in out if r["id"] not in bad]
         return out
 
     # -- segments / lists ---------------------------------------------------
@@ -190,13 +272,19 @@ class HubSpot:
         return ids
 
     def batch_read(self, ids: list, props: list) -> dict:
-        """{ticket_id: {prop: value}} via batch read (100 ids/call)."""
+        """{ticket_id: {prop: value}} via batch read (100 ids/call). Test tickets dropped."""
         out = {}
+        want = list({*props, "subject"})
         for i in range(0, len(ids), 100):
-            body = {"properties": props, "inputs": [{"id": x} for x in ids[i:i + 100]]}
+            body = {"properties": want, "inputs": [{"id": x} for x in ids[i:i + 100]]}
             data = self._req("POST", "/crm/v3/objects/tickets/batch/read", json=body)
             for r in data.get("results", []):
-                out[r["id"]] = r.get("properties", {})
+                pr = r.get("properties", {})
+                if is_test_subject(pr.get("subject")):     # drop test tickets globally
+                    continue
+                out[r["id"]] = pr
+        for tid in self._tickets_with_test_contact(list(out.keys())):   # drop test-contact tickets
+            out.pop(tid, None)
         return out
 
     def action_item_last_changed(self, ids: list) -> dict:

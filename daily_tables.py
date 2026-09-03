@@ -343,6 +343,8 @@ _5B_SEGMENTS = {
     "pending_action":       ["outside sla", "pending action", "account administration"],
     "transmitted":          ["outside sla", "transmitted", "account administration"],
     "pending_confirmation": ["outside sla", "pending confirmation", "account administration"],
+    "preparing_paperwork":  ["outside sla", "preparing paperwork", "account administration"],  # added to 5a/5b
+    "wills":                ["wills", "outside sla"],                                           # "Wills Outside SLA" segment
 }
 
 
@@ -351,16 +353,21 @@ def _acct_services_outside_5b(hs):
 
     Report filter: (1 AND 2) OR (1 AND 3 AND 4)
       1 = request_type IN AA types  AND  stage != 'Completed (Account Administration)'
-      2 = member of Outside-SLA segment {Enhanced Review | Pending Action | Transmitted}
+      2 = member of Outside-SLA segment {Enhanced Review | Pending Action | Transmitted
+          | Preparing Paperwork | Wills Outside SLA}     ← Preparing Paperwork + Wills added to 5a/5b
       3 = NBIN Follow Up SLA > 15, where
           NBIN Follow Up SLA = DATEDIFF(MINUTE, notification_sent_to_assignee, sent_to_nbin__date__time)
       4 = member of Outside-SLA segment {Pending Confirmation}
-    Live snapshot (no date window). Grouped per person by 'Assigned to' (assigned_to)."""
+    'Wills Outside SLA' = Will-Preparation tickets whose In Process / Pending Review / Final Review
+    SLA is Outside SLA; clause 1 still gates it (AA request type + not Completed), so a Wills ticket
+    only appears here if it also carries an AA request type. Live snapshot (no date window).
+    Grouped per person by 'Assigned to' (assigned_to)."""
     seg = {}
     for key, kw in _5B_SEGMENTS.items():
         lid = _find_list_id(hs, kw)
         seg[key] = set(str(x) for x in hs.list_members(lid)) if lid else set()
-    branch2 = seg["enhanced_review"] | seg["pending_action"] | seg["transmitted"]
+    branch2 = (seg["enhanced_review"] | seg["pending_action"] | seg["transmitted"]
+               | seg["preparing_paperwork"] | seg["wills"])
     branch4 = seg["pending_confirmation"]
     cand = branch2 | branch4
     if not cand:
@@ -490,11 +497,127 @@ def _acct_admin_completed_within_5f(hs):
     return counts
 
 
+# ── "Amendments Required" action-item SLA (1 business day) — added into Account Services ─
+# Pipeline = Account Administration; Action Item = 'Amendments Required'; SLA = 1 business day.
+#   • Tickets Outside SLA  — currently in the action item > 1 business day (live snapshot).
+#   • Completed Within SLA — moved THROUGH the action item (exited today) in ≤ 1 business day.
+#   • Completed Outside SLA — moved through it (exited today) in > 1 business day.
+# The portal does NOT populate date_entered/exited_amendments_required (0 tickets portal-wide),
+# so entry/exit are read from the action_item property HISTORY. Business time = Mon–Fri, 24h/day,
+# America/Toronto, no holiday calendar. Cancelled/Rejected + Optimize Administrator excluded.
+_AA_PIPELINE_ID = "82170383"
+_AMEND_AI = "Amendments Required"
+_AMEND_SLA_SECONDS = 24 * 60 * 60          # 1 business day = 24 business hours
+_TERMINAL_AI = {"Cancelled", "Rejected"}
+_OPT_ADMIN_ID = "104417029"
+
+
+def _business_seconds(a_ms, b_ms):
+    """Elapsed business time (seconds) between two epoch-ms instants, counting only
+    Mon–Fri in America/Toronto (weekends contribute zero). No holiday calendar."""
+    if a_ms is None or b_ms is None or b_ms <= a_ms:
+        return 0.0
+    a = _dt.datetime.fromtimestamp(a_ms / 1000, TZ)
+    b = _dt.datetime.fromtimestamp(b_ms / 1000, TZ)
+    total, cur = 0.0, a
+    while cur < b:
+        nxt = cur.replace(hour=0, minute=0, second=0, microsecond=0) + _dt.timedelta(days=1)
+        seg_end = min(nxt, b)
+        if cur.weekday() < 5:                  # Monday=0 … Friday=4
+            total += (seg_end - cur).total_seconds()
+        cur = seg_end
+    return total
+
+
+def _history(hs, ids, props):
+    """{ticket_id: {prop: [(epoch_ms, value), …] chronological}} via batch-read-with-history."""
+    out = {}
+    for i in range(0, len(ids), 100):
+        body = {"propertiesWithHistory": props, "inputs": [{"id": x} for x in ids[i:i + 100]]}
+        data = hs._req("POST", "/crm/v3/objects/tickets/batch/read", json=body)
+        for r in data.get("results", []):
+            ph = r.get("propertiesWithHistory", {}) or {}
+            rec = {}
+            for p in props:                         # HubSpot returns history newest-first
+                seq = [(to_ms(h.get("timestamp")), h.get("value")) for h in reversed(ph.get(p, []))]
+                rec[p] = [(t, v) for t, v in seq if t is not None]
+            out[r.get("id")] = rec
+    return out
+
+
+def _value_at(seq, ts):
+    """Value in `seq` [(ms,value)…] in effect at epoch-ms `ts` (last change at or before ts)."""
+    val = None
+    for t, v in seq:
+        if t <= ts:
+            val = v
+        else:
+            break
+    return val
+
+
+def _aa_amendments_required(hs):
+    """The three Account Services columns contributed by the 'Amendments Required' 1-business-day
+    action-item SLA, each tallied per assignee. Returns (within, outside, open_outside)."""
+    id_to_name, _ = hs.owner_maps()
+    now_ms = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1000)
+    t0, t1 = today_bounds_ms()
+    within, outside, open_outside = {}, {}, {}
+
+    def _tally(bucket, aid):
+        if not aid or str(aid) == _OPT_ADMIN_ID:            # skip unassigned + Optimize Administrator
+            return
+        nm = id_to_name.get(str(aid), str(aid))
+        bucket[nm] = bucket.get(nm, 0) + 1
+
+    # currently sitting in Amendments Required (the open / Tickets-Outside-SLA candidates)
+    open_ids = [str(r["id"]) for r in hs.search(
+        [{"propertyName": "hs_pipeline", "operator": "EQ", "value": _AA_PIPELINE_ID},
+         {"propertyName": "action_item", "operator": "EQ", "value": _AMEND_AI}],
+        ["hs_pipeline"])]
+    open_set = set(open_ids)
+    # AA-pipeline tickets modified today — an exit from the action item today is a modify today
+    cand_ids = [str(r["id"]) for r in hs.search(
+        [{"propertyName": "hs_pipeline", "operator": "EQ", "value": _AA_PIPELINE_ID},
+         {"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": t0}],
+        ["hs_pipeline"])]
+
+    hist = _history(hs, list(open_set | set(cand_ids)), ["action_item", "assigned_to"])
+
+    for tid, rec in hist.items():
+        ai = rec.get("action_item", [])
+        assignee = rec.get("assigned_to", [])
+        if not ai:
+            continue
+        cur_val = ai[-1][1]
+        for j, (ts, val) in enumerate(ai):
+            if val != _AMEND_AI:
+                continue
+            nxt = ai[j + 1] if j + 1 < len(ai) else None
+            if nxt is None:                                  # still in the action item → open leg
+                if tid in open_set and cur_val == _AMEND_AI and \
+                        _business_seconds(ts, now_ms) > _AMEND_SLA_SECONDS:
+                    _tally(open_outside, _value_at(assignee, now_ms))   # whoever it is assigned to now
+                continue
+            exit_ms, next_val = nxt
+            if not (t0 <= exit_ms < t1):                     # only pass-throughs that EXITED today
+                continue
+            if next_val in _TERMINAL_AI or cur_val in _TERMINAL_AI:      # exclude cancelled/rejected
+                continue
+            dur = _business_seconds(ts, exit_ms)
+            _tally(outside if dur > _AMEND_SLA_SECONDS else within,
+                   _value_at(assignee, ts))                  # whoever was assigned during the item
+    return within, outside, open_outside
+
+
 def _account_services(hs):
-    OWNER = "hubspot_owner_id"; PM = "portfolio_manager"; SPM = "supervising_portfolio_manager"
     within = _acct_admin_completed_within_5f(hs)                                                    # 5f
     outside = _acct_admin_completed_outside_5e(hs)                                                  # 5e
     open_outside = _acct_services_outside_5b(hs)                                                    # 5b
+    a_within, a_outside, a_open = _aa_amendments_required(hs)          # + Amendments Required SLA leg
+    for src, dst in ((a_within, within), (a_outside, outside), (a_open, open_outside)):
+        for k, v in src.items():
+            dst[k] = dst.get(k, 0) + v
     names = sorted(set(within) | set(outside) | set(open_outside))
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]
     total = ["Total", sum(within.values()), sum(outside.values()), sum(open_outside.values())]

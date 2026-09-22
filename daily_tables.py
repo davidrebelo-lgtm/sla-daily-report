@@ -22,7 +22,7 @@ _EXCLUDE_BY_TITLE = {
 }
 
 
-# ── Client Service Dashboard: 4b "Tickets Outside SLA" (full dataset tree) ──────────────
+# ── Client Service Dashboard: 4b "Outstanding Tickets that are Outside SLA" (full dataset tree) ──────────────
 _CS_PIPELINES = ["82286254", "82318988", "145543234", "82088341", "82231167"]  # Transfer, Add Funds, New Accounts, Withdraw, Plans
 _ACS_ACTION_ITEMS = {"Enhanced Review", "Pending Action", "Pending Confirmation", "Transmitted",
                      "Pending Final Review", "Account Opening", "Opening Account",
@@ -206,7 +206,7 @@ def _client_service_dashboard(hs):
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]
     total = ["Total", sum(within.values()), sum(outside.values()), sum(open_outside.values())]
     return {"title": "Client Service Dashboard",
-            "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Tickets Outside SLA"],
+            "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"],
             "rows": rows, "total": total}
 
 
@@ -243,7 +243,7 @@ def _transfers(hs):
     rows = [[n, outside.get(n, 0), due.get(n, 0)] for n in names]
     total = ["Total", sum(outside.values()), sum(due.values())]
     return {"title": "Transfers (Pending Review)",
-            "columns": ["Name", "Tickets Outside SLA", "Pending Review — Due Today"],
+            "columns": ["Name", "Outstanding Tickets that are Outside SLA", "Pending Review — Due Today"],
             "rows": rows, "total": total}
 
 
@@ -334,7 +334,7 @@ def _aa_report(hs, *, sla_value, date_mode, owner_checks, exclude_admin, total_t
     return counts
 
 
-# ── Account Services "Tickets Outside SLA" — report 5b (segment-driven snapshot) ────────
+# ── Account Services "Outstanding Tickets that are Outside SLA" — report 5b (segment-driven snapshot) ────────
 _AA_COMPLETED_STAGE = "154789384"  # "Completed (Account Administration)" stage
 
 # 5b outside-SLA segments (HubSpot active lists), matched case-insensitively by keyword.
@@ -582,11 +582,16 @@ def _aa_amendments_required(hs):
          {"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": t0}],
         ["hs_pipeline"])]
 
-    hist = _history(hs, list(open_set | set(cand_ids)), ["action_item", "assigned_to"])
+    ids = list(open_set | set(cand_ids))
+    # action_item history only — 'assigned_to' is a calculated property and requesting its
+    # HISTORY makes batch/read return 400, so read it as a current value instead. (Its current
+    # value is the right attribution here anyway: for amendments that's the processor, i.e. Aaron.)
+    hist = _history(hs, ids, ["action_item"])
+    assigned_now = {str(tid): p.get("assigned_to") for tid, p in hs.batch_read(ids, ["assigned_to"]).items()}
 
     for tid, rec in hist.items():
         ai = rec.get("action_item", [])
-        assignee = rec.get("assigned_to", [])
+        aid = assigned_now.get(str(tid))
         if not ai:
             continue
         cur_val = ai[-1][1]
@@ -597,7 +602,7 @@ def _aa_amendments_required(hs):
             if nxt is None:                                  # still in the action item → open leg
                 if tid in open_set and cur_val == _AMEND_AI and \
                         _business_seconds(ts, now_ms) > _AMEND_SLA_SECONDS:
-                    _tally(open_outside, _value_at(assignee, now_ms))   # whoever it is assigned to now
+                    _tally(open_outside, aid)                # whoever it is assigned to
                 continue
             exit_ms, next_val = nxt
             if not (t0 <= exit_ms < t1):                     # only pass-throughs that EXITED today
@@ -605,8 +610,7 @@ def _aa_amendments_required(hs):
             if next_val in _TERMINAL_AI or cur_val in _TERMINAL_AI:      # exclude cancelled/rejected
                 continue
             dur = _business_seconds(ts, exit_ms)
-            _tally(outside if dur > _AMEND_SLA_SECONDS else within,
-                   _value_at(assignee, ts))                  # whoever was assigned during the item
+            _tally(outside if dur > _AMEND_SLA_SECONDS else within, aid)  # assignee on the ticket
     return within, outside, open_outside
 
 
@@ -622,7 +626,7 @@ def _account_services(hs):
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]
     total = ["Total", sum(within.values()), sum(outside.values()), sum(open_outside.values())]
     return {"title": "Account Services Dashboard",
-            "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Tickets Outside SLA"],
+            "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"],
             "rows": rows, "total": total}
 
 
@@ -716,7 +720,7 @@ def _advisor_support_nbin(hs):
 
 
 # ── Advisor Support (Pending Action) + Advisor Support Dashboard (via reports.py) ──────
-_ADVISOR_COLS = ["Name", "Tickets Completed Within SLA", "Tickets Completed Outside SLA", "Tickets Outside SLA"]
+_ADVISOR_COLS = ["Name", "Tickets Completed Within SLA", "Tickets Completed Outside SLA", "Outstanding Tickets that are Outside SLA"]
 
 
 def _people_tbl(title, w, o, oo, cols):
@@ -801,11 +805,11 @@ def build_tables(hs):
         ("Client Service Tickets with NBIN", _client_service_nbin,
          ["Tickets With NBIN", "Completed Outside SLA Last 7 Days"]),
         ("Account Services Dashboard", _account_services,
-         ["Name", "Completed Within SLA", "Completed Outside SLA", "Tickets Outside SLA"]),
+         ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"]),
         ("Transfers (Pending Review)", _transfers,
-         ["Name", "Tickets Outside SLA", "Pending Review — Due Today"]),
+         ["Name", "Outstanding Tickets that are Outside SLA", "Pending Review — Due Today"]),
         ("Client Service Dashboard", _client_service_dashboard,
-         ["Name", "Completed Within SLA", "Completed Outside SLA", "Tickets Outside SLA"]),
+         ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"]),
     ]
     tables = []
     for title, fn, cols in specs:

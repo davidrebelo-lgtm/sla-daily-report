@@ -73,7 +73,7 @@ if not tok:
     st.stop()
 
 st.markdown(f'<h1 style="color:{NAVY};margin-bottom:0">Daily SLA Report</h1>'
-            f'<div style="color:{MUTED}">Tickets Outside SLA</div>', unsafe_allow_html=True)
+            f'<div style="color:{MUTED}">Outstanding Tickets that are Outside SLA</div>', unsafe_allow_html=True)
 
 try:
     tables, when = _load(tok[-6:])

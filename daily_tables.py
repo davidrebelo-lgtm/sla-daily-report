@@ -557,61 +557,46 @@ def _value_at(seq, ts):
 
 
 def _aa_amendments_required(hs):
-    """The three Account Services columns contributed by the 'Amendments Required' 1-business-day
-    action-item SLA, each tallied per assignee. Returns (within, outside, open_outside)."""
+    """'Amendments Required' 1-business-day action-item SLA → the Account Services columns.
+
+    ONLY the open 'Outstanding Outside SLA' leg is computed (tickets sitting in the action item
+    now, past 1 business day, by current assignee — typically Aaron). It is cheap: only a couple
+    of tickets are ever in Amendments Required at once, so we fetch action_item history for just
+    those ids.
+
+    The completed-within/outside sub-counts are intentionally NOT computed here. There is no cheap
+    anchor for 'exited Amendments Required today': date_entered_/date_exited_amendments_required and
+    amendments_requested_date are all unpopulated portal-wide, and the AA pipeline's
+    hs_lastmodifieddate is refreshed on ~every ticket daily (a formula recalc), so a 'modified today'
+    candidate scan returns the whole pipeline (~21k) — far too many to pull history for on each page
+    load (that scan was the cause of the never-finishing dashboard). To enable the completed legs
+    cheaply, populate date_entered_amendments_required + date_exited_amendments_required via a
+    workflow; then they become a small date-window search. Returns (within, outside, open_outside)."""
     id_to_name, _ = hs.owner_maps()
     now_ms = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1000)
-    t0, t1 = today_bounds_ms()
-    within, outside, open_outside = {}, {}, {}
 
-    def _tally(bucket, aid):
-        if not aid or str(aid) == _OPT_ADMIN_ID:            # skip unassigned + Optimize Administrator
-            return
-        nm = id_to_name.get(str(aid), str(aid))
-        bucket[nm] = bucket.get(nm, 0) + 1
-
-    # currently sitting in Amendments Required (the open / Tickets-Outside-SLA candidates)
     open_ids = [str(r["id"]) for r in hs.search(
         [{"propertyName": "hs_pipeline", "operator": "EQ", "value": _AA_PIPELINE_ID},
          {"propertyName": "action_item", "operator": "EQ", "value": _AMEND_AI}],
         ["hs_pipeline"])]
-    open_set = set(open_ids)
-    # AA-pipeline tickets modified today — an exit from the action item today is a modify today
-    cand_ids = [str(r["id"]) for r in hs.search(
-        [{"propertyName": "hs_pipeline", "operator": "EQ", "value": _AA_PIPELINE_ID},
-         {"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": t0}],
-        ["hs_pipeline"])]
+    if not open_ids:
+        return {}, {}, {}
+    hist = _history(hs, open_ids, ["action_item"])                       # tiny set → cheap
+    assigned_now = {str(tid): p.get("assigned_to") for tid, p in hs.batch_read(open_ids, ["assigned_to"]).items()}
 
-    ids = list(open_set | set(cand_ids))
-    # action_item history only — 'assigned_to' is a calculated property and requesting its
-    # HISTORY makes batch/read return 400, so read it as a current value instead. (Its current
-    # value is the right attribution here anyway: for amendments that's the processor, i.e. Aaron.)
-    hist = _history(hs, ids, ["action_item"])
-    assigned_now = {str(tid): p.get("assigned_to") for tid, p in hs.batch_read(ids, ["assigned_to"]).items()}
-
-    for tid, rec in hist.items():
-        ai = rec.get("action_item", [])
-        aid = assigned_now.get(str(tid))
-        if not ai:
+    open_outside = {}
+    for tid in open_ids:
+        ai = (hist.get(tid) or {}).get("action_item", [])
+        if not ai or ai[-1][1] != _AMEND_AI:                # must still be in the action item
             continue
-        cur_val = ai[-1][1]
-        for j, (ts, val) in enumerate(ai):
-            if val != _AMEND_AI:
-                continue
-            nxt = ai[j + 1] if j + 1 < len(ai) else None
-            if nxt is None:                                  # still in the action item → open leg
-                if tid in open_set and cur_val == _AMEND_AI and \
-                        _business_seconds(ts, now_ms) > _AMEND_SLA_SECONDS:
-                    _tally(open_outside, aid)                # whoever it is assigned to
-                continue
-            exit_ms, next_val = nxt
-            if not (t0 <= exit_ms < t1):                     # only pass-throughs that EXITED today
-                continue
-            if next_val in _TERMINAL_AI or cur_val in _TERMINAL_AI:      # exclude cancelled/rejected
-                continue
-            dur = _business_seconds(ts, exit_ms)
-            _tally(outside if dur > _AMEND_SLA_SECONDS else within, aid)  # assignee on the ticket
-    return within, outside, open_outside
+        entry = ai[-1][0]                                   # most recent change → into Amendments Required
+        aid = assigned_now.get(str(tid))
+        if not aid or str(aid) == _OPT_ADMIN_ID:            # skip unassigned + Optimize Administrator
+            continue
+        if _business_seconds(entry, now_ms) > _AMEND_SLA_SECONDS:
+            nm = id_to_name.get(str(aid), str(aid))
+            open_outside[nm] = open_outside.get(nm, 0) + 1
+    return {}, {}, open_outside
 
 
 def _account_services(hs):

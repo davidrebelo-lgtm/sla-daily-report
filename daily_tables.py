@@ -617,19 +617,20 @@ def _account_services(hs):
 
 # ── Account Administration Tickets With NBIN — 6d / 6g ─────────────────────────────────
 def _account_admin_nbin(hs):
-    filters = [
+    # "Completed Outside SLA Last 7 Days" (=35): AA tickets Closed/Completed in the last 7 days
+    # (EDT) that carried an NBIN notification to the assignee.
+    completed_outside = len(hs.search([
         {"propertyName": "request_type", "operator": "IN", "values": _ACCT_ADMIN_REQ_TYPES},
         {"propertyName": "assigned_to", "operator": "NOT_IN", "values": ["104417029"]},
         {"propertyName": "action_item", "operator": "IN", "values": ["Closed", "Completed"]},
         {"propertyName": "closed_date", "operator": "GTE", "value": _days_ago_edt_midnight(8)},
         {"propertyName": "notification_sent_to_assignee", "operator": "HAS_PROPERTY"},
-    ]
-    with_nbin = len(hs.search(filters, ["request_type"]))
-    # 6g = segment "Outside SLA - Pending Confirmation (Account Administration)", reproduced live
-    # (verified 2026-08-18 = 30): AA pipeline + Pending Confirmation + Time in Current Action Item
-    # > 2 days (rolling) intersected with the account-admin request types and not-Completed stage.
+    ], ["request_type"]))
+    # "Tickets With NBIN" (=905): AA tickets currently with NBIN — segment "Outside SLA - Pending
+    # Confirmation (Account Administration)": AA pipeline + Pending Confirmation + Time in Current
+    # Action Item > 2 days, still open (stage != Completed).
     now2 = int((_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=2)).timestamp() * 1000)
-    outside = len(hs.search([
+    tickets_with_nbin = len(hs.search([
         {"propertyName": "hs_pipeline", "operator": "EQ", "value": "82170383"},
         {"propertyName": "action_item", "operator": "EQ", "value": "Pending Confirmation"},
         {"propertyName": "date_entered_current_action_item", "operator": "LT", "value": now2},
@@ -638,7 +639,7 @@ def _account_admin_nbin(hs):
     ], ["request_type"]))
     return {"title": "Account Administration Tickets with NBIN",
             "columns": ["Tickets With NBIN", "Completed Outside SLA Last 7 Days"],
-            "flat_row": [with_nbin, outside]}
+            "flat_row": [tickets_with_nbin, completed_outside]}
 
 
 def _cs_completed_stage_ids(hs):
@@ -674,7 +675,9 @@ def _client_service_nbin(hs):
             outside += 1
     return {"title": "Client Service Tickets with NBIN",
             "columns": ["Tickets With NBIN", "Completed Outside SLA Last 7 Days"],
-            "flat_row": [with_nbin, outside]}
+            # swapped to match the corrected titles: open-still-with-NBIN → "Tickets With NBIN";
+            # completed-last-7-days → "Completed Outside SLA Last 7 Days".
+            "flat_row": [outside, with_nbin]}
 
 
 # ── Advisor Support Tickets With NBIN — 6a / 6b ────────────────────────────────────────

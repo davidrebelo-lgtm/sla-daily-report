@@ -97,7 +97,7 @@ SUPPORT_ROSTER = [
     "Shivani Shaurya", "Phil Kolanowski", "Andrew Kirkham", "Ali Vahedi",
     "Adam Goldband", "Gabriel Tan",
 ]
-OWNER_EXCLUDE = ["Stephanie Hunter", "Daniel Willett"]
+OWNER_EXCLUDE = ["Stephanie Hunter"]
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +123,7 @@ def build_open_outside(hs: HubSpot):
         if p.get(P["stage"]) == closed:                       # status ≠ Closed
             continue
         owner = p.get(P["owner"])
-        if owner and str(owner) in exclude_ids:               # owner ∉ {Stephanie, Daniel}, empty OK
-            continue
-        if "daniel willett" in (p.get(P["submitted_by"]) or "").lower():
+        if owner and str(owner) in exclude_ids:               # owner ∉ {Stephanie}, empty OK
             continue
         reason = (p.get(P["in_process_reason"]) or "").lower()
         if "nbin" in reason or "custodian" in reason:         # In Process Reason ∌ NBIN/Custodian
@@ -289,11 +287,9 @@ def _today_in_process(hs, within: bool):
     Process) vs 15. No 'create date < 8 days' filter — a ticket opened weeks ago that
     finishes In Process today still counts today. Attributed to assigned_to_support_ticket.
     Outside (2k) additionally requires Assigned to Processing known (and reason not
-    NBIN/Custodian, owner not Daniel)."""
+    NBIN/Custodian)."""
     pid, _ = hs.support_ids()
     t0, t1 = today_bounds_ms()
-    _, name_to_id = hs.owner_maps()
-    daniel = name_to_id.get("daniel willett")
     filters = [
         {"propertyName": P["pipeline"], "operator": "EQ", "value": pid},
         {"propertyName": P["action_item"], "operator": "NOT_IN", "values": ["In Process"]},
@@ -311,11 +307,8 @@ def _today_in_process(hs, within: bool):
     # Open-Outside board 2c uses it): a ticket that finished In Process today counts
     # even if it had been waiting on NBIN. Reconciled against HubSpot 2026-07-23 —
     # keeping the two NBIN-reason tickets is what makes Hardeepika = 20 (not 18).
-    def keep(r):
-        return not (daniel and str(r.get(P["owner"])) == daniel)   # owner ≠ Daniel Willett
-
     return _classify(rows, mins, 15, within,
-                     lambda r: r.get(P["assigned_to_support_ticket"]), keep=keep, tag="today IP")
+                     lambda r: r.get(P["assigned_to_support_ticket"]), tag="today IP")
 
 
 def _today_pending_conf(hs, within: bool):

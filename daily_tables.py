@@ -19,6 +19,7 @@ _EXCLUDE_BY_TITLE = {
     "Client Service Dashboard": {"Rohit Kapoor"},
     "Transfers (Pending Review)": {"Rohit Kapoor", "Srijan Ahuja", "Jay Suba"},
     "Account Services Dashboard": {"Rashi Tiwari"},
+    "Advisor Support Dashboard": {"Michael McLaren", "Steven McMackon", "Darcy Lillie"},
 }
 
 
@@ -456,16 +457,18 @@ def _acct_admin_completed_outside_5e(hs):
 def _acct_admin_completed_within_5f(hs):
     """Report 5f — Account Admin Tickets Completed Today (Within SLA).
 
-    Filter: 1 AND 7 AND (2 OR 3 OR 4 OR 5 OR 6)
+    Filter (verbatim from the report panel): 1 AND 7 AND (2 OR 3 OR 4 OR 5 OR 6)
       1  request_type IN AA types
       2-5 date_entered_<stage> is Today AND <stage> SLA (Account Administration) = 'Within SLA'
           for stage in {Enhanced Review, Transmitted, Preparing Paperwork, Pending Action}
-      6  member of segment 'Account Opening Completed Today (Within SLA)'   (the bulk of the volume)
-      7  Ticket Owner Check unknown/False = NOT(assigned_to_within_sla == hubspot_owner_id)
-    assigned_to_within_sla is unpopulated portal-wide, so clause 7 as-written never fires; the
-    report's effective behaviour (only the two AA processors appear, advisor self-completed tickets
-    drop out) is reproduced by excluding assigned_to == hubspot_owner_id. Grouped by 'Assigned to'
-    = assigned_to. Target 2026-08-24 = 64 (Athena 45, Rohit 19)."""
+      6  member of segment 'Account Opening Completed Today (Within SLA)'
+      7  Ticket Owner Check is unknown OR False   (formula on assigned_to_within_sla vs owner)
+    Grouped by 'Assigned to' = **assigned_to_processing** (the AA processor), NOT assigned_to.
+    Reconciled live 2026-10-15: grouping the 52 matching tickets by assigned_to_processing gives
+    Athena 38 / Rohit 14 = 52, exactly the HubSpot report. assigned_to_within_sla is blank on every
+    ticket, so clause 7 evaluates 'unknown' and keeps everything — it is applied literally here.
+    (The old build grouped by assigned_to and dropped assignee==owner/PM tickets, which removed 23
+    advisor-submitted tickets the report counts and mis-attributed others — it showed 26 vs 52.)"""
     t0, t1 = today_bounds_ms()
     ids = set()
     for date_prop, sla_prop in _AA_STAGES:
@@ -481,18 +484,20 @@ def _acct_admin_completed_within_5f(hs):
         ids.update(str(x) for x in hs.list_members(lid))
     if not ids:
         return {}
-    props = hs.batch_read(list(ids), ["request_type", "assigned_to", "hubspot_owner_id"])
+    props = hs.batch_read(list(ids), ["request_type", "assigned_to_processing",
+                                      "assigned_to_within_sla", "hubspot_owner_id"])
     id_to_name, _ = hs.owner_maps()
     counts = {}
     for p in props.values():
         if p.get("request_type") not in _ACCT_ADMIN_REQ_TYPES:          # clause 1
             continue
-        at = p.get("assigned_to")
-        if not at:
+        aws = p.get("assigned_to_within_sla")                           # clause 7: Ticket Owner Check
+        if aws and str(aws) == str(p.get("hubspot_owner_id")):          # True -> excluded; unknown/False kept
             continue
-        if str(at) == str(p.get("hubspot_owner_id")):                   # clause 7 (Ticket Owner Check)
+        atp = p.get("assigned_to_processing")                           # report's 'Assigned to' column
+        if not atp:
             continue
-        nm = id_to_name.get(str(at), str(at))
+        nm = id_to_name.get(str(atp), str(atp))
         counts[nm] = counts.get(nm, 0) + 1
     return counts
 
@@ -720,7 +725,7 @@ def _people_tbl(title, w, o, oo, cols):
 
 _2B_ASSIGNEES = {"Batuhan Karabay", "Christian Alvarez", "Ryan Connon", "Shivani Shaurya",
                  "Phil Kolanowski", "Andrew Kirkham", "Ali Vahedi", "Adam Goldband", "Gabriel Tan"}
-_2B_OWNER_EXCLUDE = {"Stephanie Hunter", "Daniel Willett"}
+_2B_OWNER_EXCLUDE = {"Stephanie Hunter"}
 
 
 def _advisor_open_pending_action_2b(hs):
@@ -728,11 +733,11 @@ def _advisor_open_pending_action_2b(hs):
 
     Members of segment 'Outside SLA - Pending Action (Support Tickets)' AND:
       2  pipeline Support Ticket, stage != Closed
-      3  owner not Stephanie Hunter / Daniel Willett (empty owner OK); submitted_by not Daniel Willett
+      3  owner not Stephanie Hunter (empty owner OK)
       4  Assigned to in the Advisor Support roster
       5  Ticket Opened After 5:30 is before yesterday, or unknown
     Grouped by Assigned to (assigned_to). The bare segment count previously counted tickets the
-    report excludes (e.g. a ticket owned by Daniel Willett) — this applies the full 2b filter."""
+    report excludes — this applies the full 2b filter."""
     seg = hs.sla_segments().get("Pending Action")
     if not seg:
         return {}
@@ -750,9 +755,7 @@ def _advisor_open_pending_action_2b(hs):
         if str(p.get("hs_pipeline_stage")) == str(closed):                     # filter 2
             continue
         owner = p.get("hubspot_owner_id")
-        if owner and id_to_name.get(str(owner)) in _2B_OWNER_EXCLUDE:          # filter 3a
-            continue
-        if "daniel willett" in (p.get("request_submitted_by") or "").lower():  # filter 3b
+        if owner and id_to_name.get(str(owner)) in _2B_OWNER_EXCLUDE:          # filter 3
             continue
         a = p.get("assigned_to")
         if not a:

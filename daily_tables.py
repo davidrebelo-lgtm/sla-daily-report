@@ -228,12 +228,19 @@ def _transfers(hs):
                 out[nm] = out.get(nm, 0) + 1
         return out
 
-    due = _tally([  # 3a
+    # 3a — Pending Review due today. Attributed to "Assigned to Follow-Up" (assigned_to_follow_up),
+    # the transfer follow-up person (Milan Pandurevic / Ryan Tam). That property stores the person's
+    # NAME, not an owner id. (assigned_to_processing mixed in Jay/Rohit — wrong for this column.)
+    due = {}
+    for r in hs.search([
         {"propertyName": "request_type", "operator": "EQ", "value": "Initiate a transfer"},
         {"propertyName": "follow_up_date_fixed_date", "operator": "GTE", "value": t0},
         {"propertyName": "follow_up_date_fixed_date", "operator": "LT", "value": t1},
         {"propertyName": "action_item", "operator": "NEQ", "value": "Cancelled"},
-    ])
+    ], ["assigned_to_follow_up"]):
+        nm = (r.get("assigned_to_follow_up") or "").strip()
+        if nm:
+            due[nm] = due.get(nm, 0) + 1
     outside = _tally([  # 3d
         {"propertyName": "request_type", "operator": "EQ", "value": "Initiate a transfer"},
         {"propertyName": "action_item", "operator": "EQ", "value": "Pending Final Review"},

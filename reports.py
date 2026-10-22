@@ -83,6 +83,8 @@ def _classify(rows, metric, threshold, within, owner_of, *, keep=None, tag=""):
         if keep and not keep(r):
             continue
         oid = owner_of(r)
+        if oid and str(oid) == str(r.get(P["owner"]) or ""):   # never credit a ticket to its own owner
+            continue
         if oid:
             out[r["id"]] = oid
     if unclassified:
@@ -130,6 +132,8 @@ def build_open_outside(hs: HubSpot):
             continue
         a = p.get(P["assigned_to"])
         if not a:
+            continue
+        if owner and str(a) == str(owner):                     # never credit a ticket to its own owner
             continue
         name = id_to_name.get(str(a), str(a))
         counts[name] = counts.get(name, 0) + 1

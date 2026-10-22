@@ -23,6 +23,19 @@ _EXCLUDE_BY_TITLE = {
 }
 
 
+def _is_owner(p, person, id_to_name=None):
+    """True when `person` is this ticket's own Ticket Owner (hubspot_owner_id).
+    RULE (all tables): a ticket is NEVER credited to its own owner — owners (advisors) must not
+    appear as an 'Assigned to' row. `person` may be an owner id, or a name when id_to_name is given
+    (Assigned to Follow-Up stores names). hubspot_client always fetches hubspot_owner_id."""
+    owner = p.get("hubspot_owner_id")
+    if not person or not owner:
+        return False
+    if str(person) == str(owner):
+        return True
+    return bool(id_to_name) and str(person).strip().casefold() == str(id_to_name.get(str(owner), "")).strip().casefold()
+
+
 # ── Client Service Dashboard: 4b "Outstanding Tickets that are Outside SLA" (full dataset tree) ──────────────
 _CS_PIPELINES = ["82286254", "82318988", "145543234", "82088341", "82231167"]  # Transfer, Add Funds, New Accounts, Withdraw, Plans
 _ACS_ACTION_ITEMS = {"Enhanced Review", "Pending Action", "Pending Confirmation", "Transmitted",
@@ -161,7 +174,7 @@ def _4b_outside(hs):
     counts = {}
     for p in _4b_kept_props(hs, _4B_FIELDS):
         attr = p.get("assigned_to")
-        if attr:
+        if attr and not _is_owner(p, attr):
             nm = id_to_name.get(str(attr), str(attr))
             counts[nm] = counts.get(nm, 0) + 1
     return counts
@@ -190,7 +203,7 @@ def _cs_completed(hs):
         c5 = (nbin is None) or (nbin <= 2)
         h_keep = ((ov in ("false", "")) or sla_outside) and c5
         attr = p.get("assigned_to_processing")
-        if not attr:
+        if not attr or _is_owner(p, attr):
             continue
         nm = id_to_name.get(str(attr), str(attr))
         if f_keep:
@@ -223,7 +236,7 @@ def _transfers(hs):
         out = {}
         for r in hs.search(filters, ["assigned_to_processing"]):
             oid = r.get("assigned_to_processing")
-            if oid:
+            if oid and not _is_owner(r, oid):
                 nm = id_to_name.get(str(oid), str(oid))
                 out[nm] = out.get(nm, 0) + 1
         return out
@@ -239,7 +252,7 @@ def _transfers(hs):
         {"propertyName": "action_item", "operator": "NEQ", "value": "Cancelled"},
     ], ["assigned_to_follow_up"]):
         nm = (r.get("assigned_to_follow_up") or "").strip()
-        if nm:
+        if nm and not _is_owner(r, nm, id_to_name):
             due[nm] = due.get(nm, 0) + 1
     outside = _tally([  # 3d
         {"propertyName": "request_type", "operator": "EQ", "value": "Initiate a transfer"},
@@ -335,7 +348,7 @@ def _aa_report(hs, *, sla_value, date_mode, owner_checks, exclude_admin, total_t
         if aos and any(str(p.get(of)) == str(aos) for of in owner_checks):
             continue
         attr = p.get(attribution_field)
-        if not attr:
+        if not attr or _is_owner(p, attr):
             continue
         nm = id_to_name.get(str(attr), str(attr))
         counts[nm] = counts.get(nm, 0) + 1
@@ -399,7 +412,7 @@ def _acct_services_outside_5b(hs):
         # (1 AND 2) OR (1 AND 3 AND 4)  — clause 1 already enforced above
         if (tid in branch2) or (c3 and tid in branch4):
             attr = p.get("assigned_to")
-            if not attr:
+            if not attr or _is_owner(p, attr):
                 continue
             nm = id_to_name.get(str(attr), str(attr))
             counts[nm] = counts.get(nm, 0) + 1
@@ -502,7 +515,7 @@ def _acct_admin_completed_within_5f(hs):
         if aws and str(aws) == str(p.get("hubspot_owner_id")):          # True -> excluded; unknown/False kept
             continue
         atp = p.get("assigned_to_processing")                           # report's 'Assigned to' column
-        if not atp:
+        if not atp or _is_owner(p, atp):
             continue
         nm = id_to_name.get(str(atp), str(atp))
         counts[nm] = counts.get(nm, 0) + 1
@@ -594,7 +607,9 @@ def _aa_amendments_required(hs):
     if not open_ids:
         return {}, {}, {}
     hist = _history(hs, open_ids, ["action_item"])                       # tiny set → cheap
-    assigned_now = {str(tid): p.get("assigned_to") for tid, p in hs.batch_read(open_ids, ["assigned_to"]).items()}
+    cur = hs.batch_read(open_ids, ["assigned_to"])
+    assigned_now = {str(tid): (None if _is_owner(p, p.get("assigned_to")) else p.get("assigned_to"))
+                    for tid, p in cur.items()}                          # never credit a ticket to its owner
 
     open_outside = {}
     for tid in open_ids:
@@ -765,7 +780,7 @@ def _advisor_open_pending_action_2b(hs):
         if owner and id_to_name.get(str(owner)) in _2B_OWNER_EXCLUDE:          # filter 3
             continue
         a = p.get("assigned_to")
-        if not a:
+        if not a or _is_owner(p, a):
             continue
         nm = id_to_name.get(str(a), str(a))
         if nm not in _2B_ASSIGNEES:                                            # filter 4

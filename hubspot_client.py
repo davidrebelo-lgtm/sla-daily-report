@@ -212,7 +212,7 @@ class HubSpot:
         cursor is deterministic. We also guard the Search API's hard 10k-result cap
         so silent truncation surfaces in the logs instead of quietly undercounting."""
         out, after, seen = [], None, set()
-        want = list({*props, P["assigned_to"], "hs_object_id", "subject"})
+        want = list({*props, P["assigned_to"], P["owner"], "hs_object_id", "subject"})   # owner always fetched: never credit a ticket to its own owner
         while True:
             body = {"filterGroups": filter_groups, "properties": want, "limit": 100,
                     "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}]}
@@ -274,7 +274,7 @@ class HubSpot:
     def batch_read(self, ids: list, props: list) -> dict:
         """{ticket_id: {prop: value}} via batch read (100 ids/call). Test tickets dropped."""
         out = {}
-        want = list({*props, "subject"})
+        want = list({*props, "subject", P["owner"]})   # owner always fetched: never credit a ticket to its own owner
         for i in range(0, len(ids), 100):
             body = {"properties": want, "inputs": [{"id": x} for x in ids[i:i + 100]]}
             data = self._req("POST", "/crm/v3/objects/tickets/batch/read", json=body)

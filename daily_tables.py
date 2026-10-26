@@ -204,7 +204,7 @@ def _hist_safe(hs, ids, prop):
         return {}
 
 
-def _tx_due(entry_ms, exit_ms, due_seq):
+def _tx_due(entry_ms, exit_ms, due_seq, fallback=None):
     """HubSpot's Transmitted SLA due date: the sla_due_date value set during this Transmitted
     interval (at/after entry). Falls back to entry + 2h when HubSpot set none."""
     if due_seq:
@@ -217,7 +217,7 @@ def _tx_due(entry_ms, exit_ms, due_seq):
                 break
         if last and last[0] >= entry_ms - 60_000 and to_ms(last[1]) is not None:
             return to_ms(last[1])
-    return entry_ms + _TX_SLA_MS
+    return fallback if fallback is not None else entry_ms + _TX_SLA_MS
 
 
 def _transmitted_leg(hs, exclude_open_ids=frozenset(), errors=None):
@@ -937,10 +937,72 @@ def _advisor_pending_action(hs):
     return _people_tbl("Advisor Support (Pending Action) — Daily Stats", w_pa, o_pa, open_pa, _ADVISOR_COLS)
 
 
+def _clarification_completed(hs):
+    """Clarification Required (Support pipeline) — tickets that LEFT the action item today.
+    Entry/exit from action_item history; due = HubSpot's sla_due_date stamped during that interval,
+    else entry + 2 business days. exit <= due → Within. Credited to the Assigned to at exit
+    (assigned_to history; falls back to the current assigned_to). Candidates = Support tickets whose
+    current action item was entered today (anything that left Clarification Required today has)."""
+    t0, t1 = today_bounds_ms()
+    pid, _closed = hs.support_ids()
+    within, outside = {}, {}
+    if not pid:
+        return within, outside
+    cand = hs.search([{"propertyName": "hs_pipeline", "operator": "EQ", "value": pid},
+                      {"propertyName": "date_entered_current_action_item", "operator": "GTE", "value": t0},
+                      {"propertyName": "action_item", "operator": "NEQ", "value": reports.CLARIFICATION_AI}],
+                     ["action_item"])
+    if not cand:
+        return within, outside
+    id_to_name, name_to_id = hs.owner_maps()
+    excl = {name_to_id[n.casefold()] for n in reports.OWNER_EXCLUDE if n.casefold() in name_to_id}
+    ids = [r["id"] for r in cand]
+    by_id = {r["id"]: r for r in cand}
+    ai_hist = _history(hs, ids, ["action_item"])
+    hit = [tid for tid in ids
+           if reports.CLARIFICATION_AI in [v for _, v in (ai_hist.get(tid) or {}).get("action_item", [])]]
+    if not hit:
+        return within, outside
+    due_hist = _hist_safe(hs, hit, "sla_due_date")
+    who_hist = _hist_safe(hs, hit, "assigned_to")
+    for tid in hit:
+        p = by_id[tid]
+        if p.get("hubspot_owner_id") and str(p.get("hubspot_owner_id")) in excl:
+            continue
+        seq = (ai_hist.get(tid) or {}).get("action_item", [])
+        for i, (t_in, v) in enumerate(seq):
+            if v != reports.CLARIFICATION_AI or i + 1 >= len(seq):
+                continue
+            t_out = seq[i + 1][0]
+            if not (t0 <= t_out < t1):
+                continue
+            due = _tx_due(t_in, t_out, (due_hist.get(tid) or {}).get("sla_due_date", []),
+                          fallback=reports.add_business_days(t_in, reports.CLARIFICATION_BUSINESS_DAYS))
+            aid = _value_at((who_hist.get(tid) or {}).get("assigned_to", []), t_out - 1) or p.get("assigned_to")
+            if not aid or _is_owner(p, aid):
+                continue
+            nm = id_to_name.get(str(aid), str(aid))
+            d = within if t_out <= due else outside
+            d[nm] = d.get(nm, 0) + 1
+    return within, outside
+
+
 def _advisor_dashboard(hs):
-    return _people_tbl("Advisor Support Dashboard",
-                       reports.build_today(hs, True), reports.build_today(hs, False),
-                       reports.build_open_outside(hs), _ADVISOR_COLS)
+    within, outside = reports.build_today(hs, True), reports.build_today(hs, False)
+    note = None
+    try:                                         # + Clarification Required completed today
+        c_w, c_o = _clarification_completed(hs)
+        for src, dst in ((c_w, within), (c_o, outside)):
+            for k, v in src.items():
+                dst[k] = dst.get(k, 0) + v
+    except Exception as e:
+        print(f"[dash][WARN] Clarification Required leg: {e}")
+        note = f"(Clarification Required completed counts unavailable: {str(e)[:200]})"
+    t = _people_tbl("Advisor Support Dashboard", within, outside,
+                    reports.build_open_outside(hs), _ADVISOR_COLS)
+    if note:
+        t["note"] = note
+    return t
 
 
 def build_tables(hs):

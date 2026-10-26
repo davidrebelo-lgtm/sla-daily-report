@@ -11,6 +11,7 @@ ticket id (so a ticket counted in two sub-reports counts once) and tally per own
 from __future__ import annotations
 
 import sys
+import time
 
 from hubspot_client import HubSpot, P, days_ago_ms, today_bounds_ms, to_ms, to_num
 
@@ -117,7 +118,16 @@ def build_open_outside(hs: HubSpot):
     seg = hs.sla_segments()
     ids = set()
     for list_id in seg.values():
-        ids.update(hs.list_members(list_id))
+        ids.update(str(x) for x in hs.list_members(list_id))
+    # + Clarification Required (added 2026-10-26): every Support ticket currently in action item
+    # "Clarification Required" whose SLA has passed. There is no "Outside SLA - Clarification
+    # Required" segment, so these were never counted. SLA = 2 business days (HubSpot stamps
+    # action_item_sla = 18 + sla_due_date = entry + 2 business days); if HubSpot didn't stamp a due
+    # date we compute entry (date_entered_current_action_item) + 2 business days ourselves.
+    now_ms = int(time.time() * 1000)
+    for r in clarification_open(hs):
+        if clarification_due(r) is not None and now_ms > clarification_due(r):
+            ids.add(str(r["id"]))
     props = hs.batch_read(list(ids), [P["assigned_to"], P["owner"], P["stage"],
                                        P["submitted_by"], P["in_process_reason"]])
     counts = {}
@@ -138,6 +148,46 @@ def build_open_outside(hs: HubSpot):
         name = id_to_name.get(str(a), str(a))
         counts[name] = counts.get(name, 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Clarification Required (Support pipeline) — SLA 2 business days
+# ---------------------------------------------------------------------------
+CLARIFICATION_AI = "Clarification Required"
+CLARIFICATION_BUSINESS_DAYS = 2
+
+
+def add_business_days(ms, n):
+    """epoch-ms + n business days (Mon–Fri, America/Toronto, same clock time). Matches HubSpot's
+    stamped due dates (Thu 18:12 + 2 → Mon 18:12; Mon 12:40 + 2 → Wed 12:40)."""
+    import datetime as _d
+    from hubspot_client import TZ
+    t = _d.datetime.fromtimestamp(ms / 1000, TZ)
+    added = 0
+    while added < n:
+        t += _d.timedelta(days=1)
+        if t.weekday() < 5:
+            added += 1
+    return int(t.timestamp() * 1000)
+
+
+def clarification_open(hs: HubSpot):
+    """Support tickets currently in Clarification Required."""
+    pid, _closed = hs.support_ids()
+    if not pid:
+        return []
+    return hs.search([{"propertyName": P["pipeline"], "operator": "EQ", "value": pid},
+                      {"propertyName": P["action_item"], "operator": "EQ", "value": CLARIFICATION_AI}],
+                     ["sla_due_date", "action_item_sla", "date_entered_current_action_item"])
+
+
+def clarification_due(r):
+    """HubSpot's stamped due date, else entry + 2 business days."""
+    due = to_ms(r.get("sla_due_date")) if to_num(r.get("action_item_sla")) else None
+    if due is None:
+        entry = to_ms(r.get("date_entered_current_action_item"))
+        due = add_business_days(entry, CLARIFICATION_BUSINESS_DAYS) if entry else None
+    return due
 
 
 # ---------------------------------------------------------------------------

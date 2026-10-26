@@ -13,7 +13,8 @@ import reports
 from hubspot_client import to_ms, to_num, today_bounds_ms, TZ
 
 # Test/demo owners to exclude from every people table (they aren't real reps).
-_EXCLUDE_NAMES = {"Transition Demo", "Optimize Administrator"}   # dropped from every people table
+_EXCLUDE_NAMES = {"Transition Demo", "Optimize Administrator",
+                  "Hardeepika Ahluwalia", "Gabriel Tan"}   # dropped from every people table (added 2026-10-26)
 # Extra per-section exclusions (by table title)
 _EXCLUDE_BY_TITLE = {
     "Client Service Dashboard": {"Rohit Kapoor"},
@@ -219,8 +220,10 @@ def _tx_due(entry_ms, exit_ms, due_seq):
     return entry_ms + _TX_SLA_MS
 
 
-def _transmitted_leg(hs, exclude_open_ids=frozenset()):
+def _transmitted_leg(hs, exclude_open_ids=frozenset(), errors=None):
     """(within, outside, open_outside) per person for the Transmitted step.
+      The open and completed halves are computed independently: if one fails, the other still
+      counts, and the error text is appended to `errors` (shown as a note under the table).
       within/outside = tickets that LEFT Transmitted today (America/Toronto), exit <= due → within.
       open_outside   = tickets in Transmitted now whose due has passed, excluding ids already
                        counted by 4b (so nobody is double-counted in Outstanding)."""
@@ -234,11 +237,27 @@ def _transmitted_leg(hs, exclude_open_ids=frozenset()):
         nm = id_to_name.get(str(aid), str(aid))
         d[nm] = d.get(nm, 0) + 1
 
+    errors = errors if errors is not None else []
+    open_outside, within, outside = {}, {}, {}
+
     # ---- open: currently in Transmitted -----------------------------------------------------
+    try:
+        _tx_open(hs, exclude_open_ids, now_ms, credit, open_outside)
+    except Exception as e:
+        errors.append(f"open: {e}")
+    # ---- completed: left Transmitted today --------------------------------------------------
+    try:
+        _tx_completed(hs, t0, t1, credit, within, outside)
+    except Exception as e:
+        errors.append(f"completed: {e}")
+    return within, outside, open_outside
+
+
+def _tx_open(hs, exclude_open_ids, now_ms, credit, open_outside):
     open_rows = hs.search([{"propertyName": "hs_pipeline", "operator": "IN", "values": _CS_PIPELINES},
                            {"propertyName": "action_item", "operator": "EQ", "value": _TX_AI}],
                           ["sla_due_date", "action_item_sla"])
-    open_outside = {}
+
     def hs_due(r):   # HubSpot's own Transmitted due date, when it stamped one
         return to_ms(r.get("sla_due_date")) if to_num(r.get("action_item_sla")) else None
 
@@ -256,16 +275,16 @@ def _transmitted_leg(hs, exclude_open_ids=frozenset()):
         if now_ms > due:
             credit(open_outside, r.get("assigned_to"), r)
 
-    # ---- completed: left Transmitted today --------------------------------------------------
+
+def _tx_completed(hs, t0, t1, credit, within, outside):
     d0 = _dt.datetime.now(TZ).date() - _dt.timedelta(days=_TX_LOOKBACK_DAYS)
     d0_ms = int(_dt.datetime(d0.year, d0.month, d0.day, tzinfo=_dt.timezone.utc).timestamp() * 1000)
     cand = hs.search([{"propertyName": "hs_pipeline", "operator": "IN", "values": _CS_PIPELINES},
                       {"propertyName": "transmitted_date", "operator": "GTE", "value": d0_ms},
                       {"propertyName": "action_item", "operator": "NEQ", "value": _TX_AI}],
                      ["assigned_to_final_review"])
-    within, outside = {}, {}
     if not cand:
-        return within, outside, open_outside
+        return
     ids = [r["id"] for r in cand]
     by_id = {r["id"]: r for r in cand}
     ai_hist = _history(hs, ids, ["action_item"])
@@ -283,7 +302,6 @@ def _transmitted_leg(hs, exclude_open_ids=frozenset()):
             aid = _value_at((who_hist.get(tid) or {}).get("assigned_to", []), t_out - 1) \
                 or by_id[tid].get("assigned_to_final_review")
             credit(within if t_out <= due else outside, aid, by_id[tid])
-    return within, outside, open_outside
 
 
 _CS_COMPLETED_STAGES = ["187223990", "154816395", "154811555", "154790244", "154782076"]
@@ -322,20 +340,26 @@ def _cs_completed(hs):
 def _client_service_dashboard(hs):
     open_outside, open_ids = _4b_outside(hs, with_ids=True)                                   # 4b
     within, outside = _cs_completed(hs)                                                       # 4f / 4h
-    try:                                                                     # + Transmitted SLA leg
-        tx_within, tx_outside, tx_open = _transmitted_leg(hs, open_ids)
+    tx_err = []                                                              # + Transmitted SLA leg
+    try:
+        tx_within, tx_outside, tx_open = _transmitted_leg(hs, open_ids, tx_err)
     except Exception as e:      # fail-safe: never let this leg break the 4b/4f/4h numbers
-        print(f"[dash][WARN] Transmitted leg skipped: {e}")
+        tx_err.append(str(e))
         tx_within, tx_outside, tx_open = {}, {}, {}
+    if tx_err:
+        print(f"[dash][WARN] Transmitted leg: {tx_err}")
     for src, dst in ((tx_within, within), (tx_outside, outside), (tx_open, open_outside)):
         for k, v in src.items():
             dst[k] = dst.get(k, 0) + v
     names = sorted(set(within) | set(outside) | set(open_outside))
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]
     total = ["Total", sum(within.values()), sum(outside.values()), sum(open_outside.values())]
-    return {"title": "Client Service Dashboard",
-            "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"],
-            "rows": rows, "total": total}
+    out = {"title": "Client Service Dashboard",
+           "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"],
+           "rows": rows, "total": total}
+    if tx_err:                  # make a failure visible instead of silently dropping Srijan
+        out["note"] = "(Transmitted SLA leg partly unavailable: " + "; ".join(tx_err)[:300] + ")"
+    return out
 
 
 # ── Transfers (Pending Review) — 3a / 3d, by Assigned to Processing ─────────────────────
@@ -671,8 +695,8 @@ def _business_seconds(a_ms, b_ms):
 def _history(hs, ids, props):
     """{ticket_id: {prop: [(epoch_ms, value), …] chronological}} via batch-read-with-history."""
     out = {}
-    for i in range(0, len(ids), 100):
-        body = {"propertiesWithHistory": props, "inputs": [{"id": x} for x in ids[i:i + 100]]}
+    for i in range(0, len(ids), 50):              # HubSpot caps history batch-reads at 50 records
+        body = {"propertiesWithHistory": props, "inputs": [{"id": x} for x in ids[i:i + 50]]}
         data = hs._req("POST", "/crm/v3/objects/tickets/batch/read", json=body)
         for r in data.get("results", []):
             ph = r.get("propertiesWithHistory", {}) or {}
@@ -953,8 +977,8 @@ def build_tables(hs):
         rows = t.get("rows")
         if not rows:
             continue
-        drop = _EXCLUDE_NAMES | _EXCLUDE_BY_TITLE.get(t.get("title", ""), set())
-        kept = [r for r in rows if str(r[0]) not in drop]
+        drop = {n.strip().casefold() for n in (_EXCLUDE_NAMES | _EXCLUDE_BY_TITLE.get(t.get("title", ""), set()))}
+        kept = [r for r in rows if str(r[0]).strip().casefold() not in drop]
         if len(kept) != len(rows):
             t["rows"] = kept
             ncol = len(t["columns"])

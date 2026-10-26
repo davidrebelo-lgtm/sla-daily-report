@@ -168,16 +168,122 @@ def _4b_kept_props(hs, fields):
     return kept
 
 
-def _4b_outside(hs):
-    """Report 4b — Client Service tickets currently Outside SLA, per assigned_to."""
+def _4b_outside(hs, with_ids=False):
+    """Report 4b — Client Service tickets currently Outside SLA, per assigned_to.
+    with_ids=True also returns the set of kept ticket ids (used to de-dupe the Transmitted leg)."""
     id_to_name, _ = hs.owner_maps()
-    counts = {}
+    counts, ids = {}, set()
     for p in _4b_kept_props(hs, _4B_FIELDS):
+        ids.add(str(p.get("id")))
         attr = p.get("assigned_to")
         if attr and not _is_owner(p, attr):
             nm = id_to_name.get(str(attr), str(attr))
             counts[nm] = counts.get(nm, 0) + 1
-    return counts
+    return (counts, ids) if with_ids else counts
+
+
+# ── Client Service: "Transmitted" action-item SLA leg (Srijan Ahuja's step) ─────────────
+# In the Client Service pipelines the ticket's Assigned to switches to the Transmitted reviewer
+# (currently always Srijan Ahuja) when action_item -> Transmitted, then back to the processor at
+# Pending Confirmation. 4f/4h credit Assigned to Processing and so never credit this step.
+# SLA = 2 hours (knowledge.optimize.ca/service-request-slas: Transmitted = 2 Hours, every request type).
+# Where HubSpot stamps sla_due_date for Transmitted (action_item_sla = 2) we use HubSpot's due date
+# exactly; where it doesn't (Transfer + Plans pipelines) due = entry + 2h.
+# Entry/exit times come from action_item HISTORY (date_entered_transmitted is not populated).
+_TX_AI = "Transmitted"
+_TX_SLA_MS = 2 * 60 * 60 * 1000
+_TX_LOOKBACK_DAYS = 4          # transmitted_date window for "exited Transmitted today" candidates
+
+
+def _hist_safe(hs, ids, prop):
+    """History for one property, or {} if HubSpot refuses it (e.g. calculated properties → 400)."""
+    try:
+        return _history(hs, ids, [prop])
+    except Exception:
+        return {}
+
+
+def _tx_due(entry_ms, exit_ms, due_seq):
+    """HubSpot's Transmitted SLA due date: the sla_due_date value set during this Transmitted
+    interval (at/after entry). Falls back to entry + 2h when HubSpot set none."""
+    if due_seq:
+        before = exit_ms - 1 if exit_ms is not None else 10 ** 15
+        last = None
+        for t, v in due_seq:
+            if t <= before:
+                last = (t, v)
+            else:
+                break
+        if last and last[0] >= entry_ms - 60_000 and to_ms(last[1]) is not None:
+            return to_ms(last[1])
+    return entry_ms + _TX_SLA_MS
+
+
+def _transmitted_leg(hs, exclude_open_ids=frozenset()):
+    """(within, outside, open_outside) per person for the Transmitted step.
+      within/outside = tickets that LEFT Transmitted today (America/Toronto), exit <= due → within.
+      open_outside   = tickets in Transmitted now whose due has passed, excluding ids already
+                       counted by 4b (so nobody is double-counted in Outstanding)."""
+    t0, t1 = today_bounds_ms()
+    now_ms = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1000)
+    id_to_name, _ = hs.owner_maps()
+
+    def credit(d, aid, p):
+        if not aid or _is_owner(p, aid) or str(aid) == _OPT_ADMIN_ID:
+            return
+        nm = id_to_name.get(str(aid), str(aid))
+        d[nm] = d.get(nm, 0) + 1
+
+    # ---- open: currently in Transmitted -----------------------------------------------------
+    open_rows = hs.search([{"propertyName": "hs_pipeline", "operator": "IN", "values": _CS_PIPELINES},
+                           {"propertyName": "action_item", "operator": "EQ", "value": _TX_AI}],
+                          ["sla_due_date", "action_item_sla"])
+    open_outside = {}
+    def hs_due(r):   # HubSpot's own Transmitted due date, when it stamped one
+        return to_ms(r.get("sla_due_date")) if to_num(r.get("action_item_sla")) else None
+
+    need_entry = [r["id"] for r in open_rows if hs_due(r) is None]
+    ai_hist = _history(hs, need_entry, ["action_item"]) if need_entry else {}
+    for r in open_rows:
+        if str(r["id"]) in exclude_open_ids:
+            continue
+        due = hs_due(r)
+        if due is None:
+            seq = (ai_hist.get(r["id"]) or {}).get("action_item", [])
+            if not seq or seq[-1][1] != _TX_AI:
+                continue
+            due = seq[-1][0] + _TX_SLA_MS
+        if now_ms > due:
+            credit(open_outside, r.get("assigned_to"), r)
+
+    # ---- completed: left Transmitted today --------------------------------------------------
+    d0 = _dt.datetime.now(TZ).date() - _dt.timedelta(days=_TX_LOOKBACK_DAYS)
+    d0_ms = int(_dt.datetime(d0.year, d0.month, d0.day, tzinfo=_dt.timezone.utc).timestamp() * 1000)
+    cand = hs.search([{"propertyName": "hs_pipeline", "operator": "IN", "values": _CS_PIPELINES},
+                      {"propertyName": "transmitted_date", "operator": "GTE", "value": d0_ms},
+                      {"propertyName": "action_item", "operator": "NEQ", "value": _TX_AI}],
+                     ["assigned_to_final_review"])
+    within, outside = {}, {}
+    if not cand:
+        return within, outside, open_outside
+    ids = [r["id"] for r in cand]
+    by_id = {r["id"]: r for r in cand}
+    ai_hist = _history(hs, ids, ["action_item"])
+    due_hist = _hist_safe(hs, ids, "sla_due_date")
+    who_hist = _hist_safe(hs, ids, "assigned_to")
+    for tid in ids:
+        seq = (ai_hist.get(tid) or {}).get("action_item", [])
+        for i, (t_in, v) in enumerate(seq):
+            if v != _TX_AI or i + 1 >= len(seq):
+                continue
+            t_out = seq[i + 1][0]
+            if not (t0 <= t_out < t1):
+                continue
+            due = _tx_due(t_in, t_out, (due_hist.get(tid) or {}).get("sla_due_date", []))
+            aid = _value_at((who_hist.get(tid) or {}).get("assigned_to", []), t_out - 1) \
+                or by_id[tid].get("assigned_to_final_review")
+            credit(within if t_out <= due else outside, aid, by_id[tid])
+    return within, outside, open_outside
 
 
 _CS_COMPLETED_STAGES = ["187223990", "154816395", "154811555", "154790244", "154782076"]
@@ -214,8 +320,16 @@ def _cs_completed(hs):
 
 
 def _client_service_dashboard(hs):
-    open_outside = _4b_outside(hs)
-    within, outside = _cs_completed(hs)
+    open_outside, open_ids = _4b_outside(hs, with_ids=True)                                   # 4b
+    within, outside = _cs_completed(hs)                                                       # 4f / 4h
+    try:                                                                     # + Transmitted SLA leg
+        tx_within, tx_outside, tx_open = _transmitted_leg(hs, open_ids)
+    except Exception as e:      # fail-safe: never let this leg break the 4b/4f/4h numbers
+        print(f"[dash][WARN] Transmitted leg skipped: {e}")
+        tx_within, tx_outside, tx_open = {}, {}, {}
+    for src, dst in ((tx_within, within), (tx_outside, outside), (tx_open, open_outside)):
+        for k, v in src.items():
+            dst[k] = dst.get(k, 0) + v
     names = sorted(set(within) | set(outside) | set(open_outside))
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]
     total = ["Total", sum(within.values()), sum(outside.values()), sum(open_outside.values())]

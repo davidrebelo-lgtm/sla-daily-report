@@ -204,6 +204,23 @@ def _hist_safe(hs, ids, prop):
         return {}
 
 
+def _due_during(entry_ms, exit_ms, due_seq):
+    """The sla_due_date HubSpot stamped during [entry, exit) — i.e. the last value set at/after
+    entry (60 s tolerance) and before exit. None if HubSpot stamped no due date for that step."""
+    if not due_seq:
+        return None
+    before = exit_ms - 1 if exit_ms is not None else 10 ** 15
+    last = None
+    for t, v in due_seq:
+        if t <= before:
+            last = (t, v)
+        else:
+            break
+    if last and last[0] >= entry_ms - 60_000:
+        return to_ms(last[1])
+    return None
+
+
 def _tx_due(entry_ms, exit_ms, due_seq, fallback=None):
     """HubSpot's Transmitted SLA due date: the sla_due_date value set during this Transmitted
     interval (at/after entry). Falls back to entry + 2h when HubSpot set none."""
@@ -219,6 +236,132 @@ def _tx_due(entry_ms, exit_ms, due_seq, fallback=None):
             return to_ms(last[1])
     return fallback if fallback is not None else entry_ms + _TX_SLA_MS
 
+
+
+# ── Will Preparation + Estate Processing — back-office action-item SLAs (added 2026-10-27) ──
+# Shown in its own table, _WE_TABLE, placed directly under _WE_AFTER (the Account Services / account
+# admin section). To fold it back into Account Services, set _WE_TABLE = "Account Services Dashboard".
+_WE_TABLE = "Wills & Estates Dashboard"
+_WE_AFTER = "Account Services Dashboard"
+# SLAs from knowledge.optimize.ca/service-request-slas (Will Preparation + Estate Processing tables),
+# Back Office rows only, in BUSINESS minutes (Mon–Fri 8:00–17:00 America/Toronto — the calendar
+# HubSpot's own stamped due dates use, e.g. 2:34 PM + 4h → 9:34 AM next day).
+# Not counted (not Back Office on the SLA page, or assigned to the ticket's advisor in HubSpot):
+#   Wills  — Pending Review / Pending Final Review (advisor; HubSpot value "Pending Final Review"),
+#            Amend Wills (not on the SLA page)
+#   Estate — Sent to Client / Paper Upload (advisor), Portfolio Manager Review (PM),
+#            Pending Confirmation (Custodian, 7 business days) — add a line below to include it.
+_WE_SLA_MIN = {
+    ("82231166", "In Process"): 4 * 60,            # Will Preparation — In Process      4 hours
+    ("82231166", "Final Review"): 4 * 60,          # Will Preparation — Final Review    4 hours
+    ("112255243", "Preparing paperwork"): 15,      # Estate Processing — Preparing paperwork 15 min
+    ("112255243", "Pending Action"): 4 * 60,       # Estate Processing — Pending Action  4 hours
+    ("112255243", "Transmitted"): 2 * 60,          # Estate Processing — Transmitted     2 hours
+    ("112255243", "Final Review"): 2 * 60,         # Estate Processing — Final Review    2 hours
+}
+_BIZ_START_H, _BIZ_END_H = 8, 17
+
+
+def _add_business_minutes(ms, minutes):
+    """epoch-ms + `minutes` of business time (Mon–Fri 8:00–17:00 America/Toronto, no holidays)."""
+    t = _dt.datetime.fromtimestamp(ms / 1000, TZ)
+    left = _dt.timedelta(minutes=minutes)
+    while True:
+        day_start = t.replace(hour=_BIZ_START_H, minute=0, second=0, microsecond=0)
+        day_end = t.replace(hour=_BIZ_END_H, minute=0, second=0, microsecond=0)
+        if t.weekday() >= 5 or t >= day_end:                 # weekend / after hours → next morning
+            t = (t + _dt.timedelta(days=1)).replace(hour=_BIZ_START_H, minute=0, second=0, microsecond=0)
+            continue
+        if t < day_start:
+            t = day_start
+        if t + left <= day_end:
+            return int((t + left).timestamp() * 1000)
+        left -= (day_end - t)
+        t = day_end
+
+
+def _wills_estates_leg(hs, errors=None):
+    """(within, outside, open_outside) for the Back Office Will/Estate steps in _WE_SLA_MIN, by Assigned to.
+      open_outside   = tickets sitting in a step now, past entry + SLA (business time).
+      within/outside = tickets that LEFT a step today; exit <= entry + SLA → within.
+    Entry = date_entered_current_action_item (open) / action_item history (completed).
+    Never credits the ticket owner or Optimize Administrator. Test tickets are dropped by hs.search."""
+    errors = errors if errors is not None else []
+    t0, t1 = today_bounds_ms()
+    now_ms = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1000)
+    id_to_name, _ = hs.owner_maps()
+    pipes = sorted({p for p, _ in _WE_SLA_MIN})
+    all_steps = sorted({st for _, st in _WE_SLA_MIN})
+    within, outside, open_outside = {}, {}, {}
+
+    def credit(d, aid, p):
+        if not aid or _is_owner(p, aid) or str(aid) == _OPT_ADMIN_ID:
+            return
+        nm = id_to_name.get(str(aid), str(aid))
+        d[nm] = d.get(nm, 0) + 1
+
+    try:   # ---- open, currently in a step ---------------------------------------------------
+        for r in hs.search([{"propertyName": "hs_pipeline", "operator": "IN", "values": pipes},
+                            {"propertyName": "action_item", "operator": "IN", "values": all_steps}],
+                           ["hs_pipeline", "action_item", "date_entered_current_action_item"]):
+            sla = _WE_SLA_MIN.get((str(r.get("hs_pipeline")), r.get("action_item")))
+            entry = to_ms(r.get("date_entered_current_action_item"))
+            if sla is None or entry is None:
+                continue
+            if now_ms > _add_business_minutes(entry, sla):
+                credit(open_outside, r.get("assigned_to"), r)
+    except Exception as e:
+        errors.append(f"Wills/Estates open: {e}")
+
+    try:   # ---- completed, left a step today ------------------------------------------------
+        cand = hs.search([{"propertyName": "hs_pipeline", "operator": "IN", "values": pipes},
+                          {"propertyName": "date_entered_current_action_item", "operator": "GTE", "value": t0}],
+                         ["hs_pipeline"])
+        if cand:
+            ids = [r["id"] for r in cand]
+            by_id = {r["id"]: r for r in cand}
+            ai_hist = _history(hs, ids, ["action_item"])
+            who_hist = _hist_safe(hs, ids, "assigned_to")
+            for tid in ids:
+                p = by_id[tid]
+                pl = str(p.get("hs_pipeline"))
+                seq = (ai_hist.get(tid) or {}).get("action_item", [])
+                for i, (t_in, v) in enumerate(seq):
+                    sla = _WE_SLA_MIN.get((pl, v))
+                    if sla is None or i + 1 >= len(seq):
+                        continue
+                    t_out = seq[i + 1][0]
+                    if not (t0 <= t_out < t1):
+                        continue
+                    aid = _value_at((who_hist.get(tid) or {}).get("assigned_to", []), t_out - 1) \
+                        or p.get("assigned_to")
+                    credit(within if t_out <= _add_business_minutes(t_in, sla) else outside, aid, p)
+    except Exception as e:
+        errors.append(f"Wills/Estates completed: {e}")
+    return within, outside, open_outside
+
+
+def _merge_wills_estates(hs, tables):
+    """Add the Wills & Estates counts into the table titled _WE_TABLE (creating it if absent)."""
+    errs = []
+    w, o, oo = _wills_estates_leg(hs, errs)
+    cols = ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"]
+    t = next((x for x in tables if x.get("title") == _WE_TABLE), None)
+    if t is None:
+        t = {"title": _WE_TABLE, "columns": cols, "rows": [], "total": ["Total", 0, 0, 0]}
+        pos = next((i + 1 for i, x in enumerate(tables) if x.get("title") == _WE_AFTER), len(tables))
+        tables.insert(pos, t)
+    if len(t.get("columns", [])) != 4:
+        return
+    rows = {str(r[0]): list(r) for r in (t.get("rows") or [])}
+    for idx, src in ((1, w), (2, o), (3, oo)):
+        for nm, v in src.items():
+            rows.setdefault(nm, [nm, 0, 0, 0])[idx] += v
+    t["rows"] = [rows[n] for n in sorted(rows)]
+    t["total"] = ["Total"] + [sum(r[i] for r in t["rows"]) for i in range(1, 4)]
+    if errs:
+        t["note"] = ((t.get("note") or "") + " (Wills/Estates SLA partly unavailable: "
+                     + "; ".join(errs)[:250] + ")").strip()
 
 def _transmitted_leg(hs, exclude_open_ids=frozenset(), errors=None):
     """(within, outside, open_outside) per person for the Transmitted step.
@@ -1033,6 +1176,11 @@ def build_tables(hs):
                            "total": (["Total"] + [0] * (len(cols) - 1)) if "Name" in cols else None,
                            "flat_row": ([0] * len(cols)) if "Name" not in cols else None,
                            "note": f"(temporarily unavailable: {e})"})
+
+    try:                                    # + Will Preparation / Estate Processing SLA steps
+        _merge_wills_estates(hs, tables)
+    except Exception as e:
+        print(f"[dash][WARN] Wills/Estates merge failed: {e}")
 
     # Drop test/demo owners from any people table and recompute the totals.
     for t in tables:

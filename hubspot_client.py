@@ -37,8 +37,15 @@ _TEST_SUBJECT_RE = re.compile(
 _TEST_FAMILY_RE = re.compile(r"\b(miao|khoi|nicholas|daric)\s+corp\b", re.I)
 
 
+# Any subject containing the word "Test" (any case) is a test ticket — e.g. "TEST RPA",
+# "Test Client Aizah", "TEST-T7-7", "Test Testy", "test-tax-ticket". Whole word only, so real
+# words like "Testamentary", "Attestation" or "Contest" are NOT matched. (Added 2026-10-30.)
+_TEST_WORD_RE = re.compile(r"\btest(s|y|ing|ed)?\b", re.I)
+
+
 def is_test_subject(subject) -> bool:
-    return bool(subject and (_TEST_SUBJECT_RE.search(subject) or _TEST_FAMILY_RE.search(subject)))
+    return bool(subject and (_TEST_SUBJECT_RE.search(subject) or _TEST_FAMILY_RE.search(subject)
+                             or _TEST_WORD_RE.search(subject)))
 
 # --- ticket property internal names (resolved from the schema) --------------
 P = {

@@ -39,6 +39,9 @@ def _is_owner(p, person, id_to_name=None):
 
 # ── Client Service Dashboard: 4b "Outstanding Tickets that are Outside SLA" (full dataset tree) ──────────────
 _CS_PIPELINES = ["82286254", "82318988", "145543234", "82088341", "82231167"]  # Transfer, Add Funds, New Accounts, Withdraw, Plans
+# NOTE (2026-11-04): Transfer Out (102589101) / Model Change (104460840) are NOT added here — HubSpot report 4b
+# does not include them, so adding them would make the dashboard disagree with the CRM. Add them to the
+# HubSpot 4b report first, then here.
 _ACS_ACTION_ITEMS = {"Enhanced Review", "Pending Action", "Pending Confirmation", "Transmitted",
                      "Pending Final Review", "Account Opening", "Opening Account",
                      "Amendments Required", "Pending Signature", "Pending paperwork"}
@@ -90,7 +93,7 @@ def _4b_kept_props(hs, fields):
 
     def keep(p):
         ai = p.get("action_item"); req = p.get("request_type")
-        if req in ("Cancel / Correct", "Residual Transfer-In Sweep"):
+        if req in ("Cancel / Correct", "Residual Transfer-In Sweep"):   # 4b clause 6 (kept: it is in the report)
             return True
         due = to_ms(p.get("sla_due_date"))
         if due is None:
@@ -192,7 +195,8 @@ def _4b_outside(hs, with_ids=False):
 # exactly; where it doesn't (Transfer + Plans pipelines) due = entry + 2h.
 # Entry/exit times come from action_item HISTORY (date_entered_transmitted is not populated).
 _TX_AI = "Transmitted"
-_TX_SLA_MS = 2 * 60 * 60 * 1000
+_TX_SLA_MS = 2 * 60 * 60 * 1000   # (kept for reference; fallback now uses business time — see _TX_SLA_MIN)
+_TX_SLA_MIN = 2 * 60               # 2 BUSINESS hours (Mon–Fri 8–17 Toronto), the calendar HubSpot's stamped dues use
 _TX_LOOKBACK_DAYS = 4          # transmitted_date window for "exited Transmitted today" candidates
 
 
@@ -234,7 +238,9 @@ def _tx_due(entry_ms, exit_ms, due_seq, fallback=None):
                 break
         if last and last[0] >= entry_ms - 60_000 and to_ms(last[1]) is not None:
             return to_ms(last[1])
-    return fallback if fallback is not None else entry_ms + _TX_SLA_MS
+    # Fallback is 2 BUSINESS hours (was wall-clock entry + 2h, which flagged after-hours Transmitted
+    # tickets — e.g. one transmitted at 5:34 PM — as Outside SLA the same evening). Changed 2026-11-04.
+    return fallback if fallback is not None else _add_business_minutes(entry_ms, _TX_SLA_MIN)
 
 
 
@@ -414,13 +420,15 @@ def _tx_open(hs, exclude_open_ids, now_ms, credit, open_outside):
             seq = (ai_hist.get(r["id"]) or {}).get("action_item", [])
             if not seq or seq[-1][1] != _TX_AI:
                 continue
-            due = seq[-1][0] + _TX_SLA_MS
+            due = _add_business_minutes(seq[-1][0], _TX_SLA_MIN)   # business hours (was wall-clock +2h)
         if now_ms > due:
             credit(open_outside, r.get("assigned_to"), r)
 
 
 def _tx_completed(hs, t0, t1, credit, within, outside):
     d0 = _dt.datetime.now(TZ).date() - _dt.timedelta(days=_TX_LOOKBACK_DAYS)
+    # transmitted_date is a date-only property; HubSpot stores dates at UTC midnight, so the filter value must
+    # be UTC midnight too (Toronto midnight would silently drop the first day of the window).
     d0_ms = int(_dt.datetime(d0.year, d0.month, d0.day, tzinfo=_dt.timezone.utc).timestamp() * 1000)
     cand = hs.search([{"propertyName": "hs_pipeline", "operator": "IN", "values": _CS_PIPELINES},
                       {"propertyName": "transmitted_date", "operator": "GTE", "value": d0_ms},
@@ -494,6 +502,17 @@ def _client_service_dashboard(hs):
     for src, dst in ((tx_within, within), (tx_outside, outside), (tx_open, open_outside)):
         for k, v in src.items():
             dst[k] = dst.get(k, 0) + v
+    # + Enhanced Review completions (added 2026-11-04 — "Srijan's tickets are not being fully captured").
+    # Completed only: open Enhanced Review tickets are already in 4b (Enhanced Review is in _ACS_ACTION_ITEMS).
+    er_w, er_o = {}, {}
+    if _ER_ENABLED:
+        er_w, er_o, _, _ = _step_leg(hs, pipelines=_CS_PIPELINES, steps=_ER_STEPS,
+                                     fallback_sla_min=_ER_FALLBACK_SLA_MIN, include_open=False,
+                                     credit_fallback_prop="assigned_to_enhanced_review",
+                                     label="CS Enhanced Review", errors=tx_err)
+    for src, dst in ((er_w, within), (er_o, outside)):
+        for k, v in src.items():
+            dst[k] = dst.get(k, 0) + v
     names = sorted(set(within) | set(outside) | set(open_outside))
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]
     total = ["Total", sum(within.values()), sum(outside.values()), sum(open_outside.values())]
@@ -501,7 +520,7 @@ def _client_service_dashboard(hs):
            "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"],
            "rows": rows, "total": total}
     if tx_err:                  # make a failure visible instead of silently dropping Srijan
-        out["note"] = "(Transmitted SLA leg partly unavailable: " + "; ".join(tx_err)[:300] + ")"
+        out["note"] = "(Transmitted / Enhanced Review SLA leg partly unavailable: " + "; ".join(tx_err)[:300] + ")"
     return out
 
 
@@ -535,6 +554,9 @@ def _transfers(hs):
         nm = (r.get("assigned_to_follow_up") or "").strip()
         if nm and not _is_owner(r, nm, id_to_name):
             due[nm] = due.get(nm, 0) + 1
+    # 3d — Pending Review outside SLA, by Assigned to Processing (as the HubSpot 3d report groups it).
+    # NOTE (2026-11-04): switching 3d to Assigned to Follow-Up (like 3a) was considered; do it in the HubSpot
+    # 3d report first, then here, so the two keep matching.
     outside = _tally([  # 3d
         {"propertyName": "request_type", "operator": "EQ", "value": "Initiate a transfer"},
         {"propertyName": "action_item", "operator": "EQ", "value": "Pending Final Review"},
@@ -581,6 +603,12 @@ _ACCT_ADMIN_REQ_TYPES = [
     "Change delivery method", "Update Name", "Third Party Contribution Authorization",
     "RESP beneficiary information update", "Update DOB", "Recalculate LIF Maximum",
     "Third party online access", "Update Account Legislation", "Password reset",
+    # + Special Handling request types (General Oversight — Stefan; turned on 2026-11-05 at the user's request).
+    #   All live in the Account Administration pipeline. NOTE: HubSpot 5b/5e/5f don't list these request types,
+    #   so Account Services (and the AA NBIN table, which uses this list) will read higher than those reports
+    #   until the same five request types are added to them in HubSpot.
+    "Credit Client Account", "VALNIL Security", "Rollback Options", "Cancel / Correct",
+    "Residual Transfer-In Sweep",
 ]
 
 
@@ -650,7 +678,7 @@ _5B_SEGMENTS = {
 }
 
 
-def _acct_services_outside_5b(hs):
+def _acct_services_outside_5b(hs, missing=None):
     """Report 5b — Account Administration tickets currently Outside SLA.
 
     Report filter: (1 AND 2) OR (1 AND 3 AND 4)
@@ -667,6 +695,8 @@ def _acct_services_outside_5b(hs):
     seg = {}
     for key, kw in _5B_SEGMENTS.items():
         lid = _find_list_id(hs, kw)
+        if not lid and missing is not None:      # surfaced as a table note (added 2026-11-04)
+            missing.append(key.replace("_", " "))
         seg[key] = set(str(x) for x in hs.list_members(lid)) if lid else set()
     branch2 = (seg["enhanced_review"] | seg["pending_action"] | seg["transmitted"]
                | seg["preparing_paperwork"] | seg["wills"])
@@ -907,20 +937,153 @@ def _aa_amendments_required(hs):
     return {}, {}, open_outside
 
 
+# ── Generic action-item step leg (added 2026-11-04) ──────────────────────────────────────
+# Used for steps that no HubSpot report / segment covers yet:
+#   • Client Service "Enhanced Review" completions (Srijan Ahuja) — 4f/4h credit Assigned to Processing,
+#     so the Enhanced Review reviewer was never credited.
+#   • Account Administration "Final Review" for the three request types Rohit final-reviews.
+# Due date = the sla_due_date HubSpot stamped while the ticket sat in the step. If HubSpot stamped none,
+# `fallback_sla_min` (business minutes) is used; if that is None the ticket is left UNCLASSIFIED (counted
+# on neither side, logged) rather than guessed. Fill the fallbacks in once the SLA is confirmed.
+# Enhanced Review completions leg is OFF (no HubSpot report counts it). AA Final Review leg is ON (2026-11-05,
+# General Oversight). To turn ER on: _ER_ENABLED = True and _ER_FALLBACK_SLA_MIN = 240 (4 h per the SLA page).
+_ER_ENABLED = False
+_AA_FINAL_REVIEW_ENABLED = True     # General Oversight — Rohit's Final Review (turned on 2026-11-05)
+_ER_STEPS = ["Enhanced Review"]
+_ER_FALLBACK_SLA_MIN = None          # TODO: Enhanced Review SLA (business minutes) from the service-request SLA page
+_AA_FINAL_REVIEW_STEPS = ["Final Review"]
+_AA_FINAL_REVIEW_REQ_TYPES = ["Update Account Legislation", "RESP beneficiary information update",
+                              "Designation and change of beneficiary"]
+_AA_FINAL_REVIEW_FALLBACK_SLA_MIN = 2 * 60   # 2 business hours — the SLA HubSpot stamps on AA Final Review for other
+                                              # request types (Update DOB, Add/Update POA). HubSpot stamps NO due date
+                                              # on Rohit's 3 types, so this is what judges them. Change if the SLA differs.
+
+
+def _step_leg(hs, *, pipelines, steps, request_types=None, fallback_sla_min=None, include_open=True,
+              exclude_open_ids=frozenset(), credit_fallback_prop=None, label="", errors=None):
+    """(within, outside, open_outside, unclassified) for one action-item step, credited by Assigned to.
+      open_outside   = tickets in the step now whose due has passed (only if include_open).
+      within/outside = tickets that LEFT the step today (Toronto); exit <= due → within.
+    Never credits the ticket owner or Optimize Administrator."""
+    errors = errors if errors is not None else []
+    t0, t1 = today_bounds_ms()
+    now_ms = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1000)
+    id_to_name, _ = hs.owner_maps()
+    within, outside, open_outside = {}, {}, {}
+    unclassified = 0
+    step_set = set(steps)
+
+    def credit(d, aid, p):
+        if not aid or _is_owner(p, aid) or str(aid) == _OPT_ADMIN_ID:
+            return
+        nm = id_to_name.get(str(aid), str(aid))
+        d[nm] = d.get(nm, 0) + 1
+
+    base = [{"propertyName": "hs_pipeline", "operator": "IN", "values": list(pipelines)}]
+    if request_types:
+        base.append({"propertyName": "request_type", "operator": "IN", "values": list(request_types)})
+
+    if include_open:
+        try:
+            for r in hs.search(base + [{"propertyName": "action_item", "operator": "IN", "values": list(steps)}],
+                               ["sla_due_date", "action_item_sla", "date_entered_current_action_item"]):
+                if str(r["id"]) in exclude_open_ids:
+                    continue
+                due = to_ms(r.get("sla_due_date")) if to_num(r.get("action_item_sla")) else None
+                if due is None and fallback_sla_min:
+                    entry = to_ms(r.get("date_entered_current_action_item"))
+                    due = _add_business_minutes(entry, fallback_sla_min) if entry else None
+                if due is None:
+                    unclassified += 1
+                    continue
+                if now_ms > due:
+                    credit(open_outside, r.get("assigned_to"), r)
+        except Exception as e:
+            errors.append(f"{label} open: {e}")
+
+    try:
+        extra = [credit_fallback_prop] if credit_fallback_prop else []
+        cand = hs.search(base + [
+            {"propertyName": "date_entered_current_action_item", "operator": "GTE", "value": t0},
+            {"propertyName": "action_item", "operator": "NOT_IN", "values": list(steps)}], extra)
+        if cand:
+            ids = [r["id"] for r in cand]
+            by_id = {r["id"]: r for r in cand}
+            ai_hist = _history(hs, ids, ["action_item"])
+            hit = [t for t in ids if any(v in step_set for _, v in (ai_hist.get(t) or {}).get("action_item", []))]
+            if hit:
+                due_hist = _hist_safe(hs, hit, "sla_due_date")
+                who_hist = _hist_safe(hs, hit, "assigned_to")
+                for tid in hit:
+                    p = by_id[tid]
+                    seq = (ai_hist.get(tid) or {}).get("action_item", [])
+                    for i, (t_in, v) in enumerate(seq):
+                        if v not in step_set or i + 1 >= len(seq) or seq[i + 1][1] in step_set:
+                            continue
+                        t_out = seq[i + 1][0]
+                        if not (t0 <= t_out < t1):
+                            continue
+                        due = _due_during(t_in, t_out, (due_hist.get(tid) or {}).get("sla_due_date", []))
+                        if due is None and fallback_sla_min:
+                            due = _add_business_minutes(t_in, fallback_sla_min)
+                        if due is None:
+                            unclassified += 1
+                            continue
+                        aid = (_value_at((who_hist.get(tid) or {}).get("assigned_to", []), t_out - 1)
+                               or p.get("assigned_to") or (p.get(credit_fallback_prop) if credit_fallback_prop else None))
+                        credit(within if t_out <= due else outside, aid, p)
+    except Exception as e:
+        errors.append(f"{label} completed: {e}")
+    if unclassified:
+        print(f"[dash][INFO] {label}: {unclassified} ticket(s) had no HubSpot SLA due date and no fallback SLA "
+              f"— left unclassified (set the fallback constant to count them)")
+    return within, outside, open_outside, unclassified
+
+
 def _account_services(hs):
-    within = _acct_admin_completed_within_5f(hs)                                                    # 5f
-    outside = _acct_admin_completed_outside_5e(hs)                                                  # 5e
-    open_outside = _acct_services_outside_5b(hs)                                                    # 5b
-    a_within, a_outside, a_open = _aa_amendments_required(hs)          # + Amendments Required SLA leg
-    for src, dst in ((a_within, within), (a_outside, outside), (a_open, open_outside)):
+    """Account Services = 5f / 5e / 5b + Amendments Required + AA Final Review (Rohit's 3 request types).
+    Each leg is isolated (added 2026-11-04): one failing leg becomes a note under the table instead of
+    blanking the whole section — the 'Account Services Dashboard is not working' symptom."""
+    within, outside, open_outside, notes, missing = {}, {}, {}, [], []
+
+    def add(dst, src):
         for k, v in src.items():
             dst[k] = dst.get(k, 0) + v
+
+    for label, fn, dst in (("Completed Within (5f)", _acct_admin_completed_within_5f, within),
+                           ("Completed Outside (5e)", _acct_admin_completed_outside_5e, outside),
+                           ("Outstanding (5b)", lambda h: _acct_services_outside_5b(h, missing), open_outside)):
+        try:
+            add(dst, fn(hs))
+        except Exception as e:
+            print(f"[dash][WARN] Account Services {label}: {e}")
+            notes.append(f"{label} unavailable: {str(e)[:120]}")
+    if missing:
+        notes.append("segment(s) not found, counted as 0: " + ", ".join(missing))
+    try:
+        a_within, a_outside, a_open = _aa_amendments_required(hs)      # + Amendments Required SLA leg
+        add(within, a_within); add(outside, a_outside); add(open_outside, a_open)
+    except Exception as e:
+        print(f"[dash][WARN] Account Services Amendments Required: {e}")
+        notes.append(f"Amendments Required unavailable: {str(e)[:120]}")
+    fr_err = []                                                        # + AA Final Review leg (off by default)
+    if _AA_FINAL_REVIEW_ENABLED:
+        fr_w, fr_o, fr_open, _ = _step_leg(hs, pipelines=[_AA_PIPELINE_ID], steps=_AA_FINAL_REVIEW_STEPS,
+                                           request_types=_AA_FINAL_REVIEW_REQ_TYPES,
+                                           fallback_sla_min=_AA_FINAL_REVIEW_FALLBACK_SLA_MIN,
+                                           label="AA Final Review", errors=fr_err)
+        add(within, fr_w); add(outside, fr_o); add(open_outside, fr_open)
+    if fr_err:
+        notes.append("Final Review leg partly unavailable: " + "; ".join(fr_err)[:150])
     names = sorted(set(within) | set(outside) | set(open_outside))
     rows = [[n, within.get(n, 0), outside.get(n, 0), open_outside.get(n, 0)] for n in names]
     total = ["Total", sum(within.values()), sum(outside.values()), sum(open_outside.values())]
-    return {"title": "Account Services Dashboard",
-            "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"],
-            "rows": rows, "total": total}
+    out = {"title": "Account Services Dashboard",
+           "columns": ["Name", "Completed Within SLA", "Completed Outside SLA", "Outstanding Tickets that are Outside SLA"],
+           "rows": rows, "total": total}
+    if notes:
+        out["note"] = "(" + " | ".join(notes) + ")"
+    return out
 
 
 # ── Account Administration Tickets With NBIN — 6d / 6g ─────────────────────────────────

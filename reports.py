@@ -117,22 +117,35 @@ def build_open_outside(hs: HubSpot):
 
     seg = hs.sla_segments()
     ids = set()
-    for list_id in seg.values():
-        ids.update(str(x) for x in hs.list_members(list_id))
+    seg_stages = {}                       # ticket id -> stages whose Outside-SLA segment it is a member of
+    for stage, list_id in seg.items():
+        for x in hs.list_members(list_id):
+            ids.add(str(x))
+            seg_stages.setdefault(str(x), set()).add(stage)
     # + Clarification Required (added 2026-10-26): every Support ticket currently in action item
     # "Clarification Required" whose SLA has passed. There is no "Outside SLA - Clarification
     # Required" segment, so these were never counted. SLA = 2 business days (HubSpot stamps
     # action_item_sla = 18 + sla_due_date = entry + 2 business days); if HubSpot didn't stamp a due
     # date we compute entry (date_entered_current_action_item) + 2 business days ourselves.
     now_ms = int(time.time() * 1000)
+    clar_ids = set()
     for r in clarification_open(hs):
         if clarification_due(r) is not None and now_ms > clarification_due(r):
             ids.add(str(r["id"]))
+            clar_ids.add(str(r["id"]))
     props = hs.batch_read(list(ids), [P["assigned_to"], P["owner"], P["stage"],
-                                       P["submitted_by"], P["in_process_reason"]])
+                                       P["submitted_by"], P["in_process_reason"], P["action_item"]])
     counts = {}
-    for p in props.values():
+    for tid, p in props.items():
         if p.get(P["stage"]) == closed:                       # status ≠ Closed
+            continue
+        # Stale segment members (added 2026-11-04): HubSpot segments recalculate on a lag, so a ticket
+        # that has already moved on (e.g. out of Pending Action) can still sit in the segment and be counted
+        # as outside SLA for a step it is no longer in. Count it only while its Action Item still matches a
+        # segment it belongs to (or it is a Clarification Required hit). This is also what keeps the
+        # Pending Action numbers here consistent with the "Advisor Support (Pending Action)" table.
+        tid = str(tid)
+        if tid not in clar_ids and p.get(P["action_item"]) not in seg_stages.get(tid, set()):
             continue
         owner = p.get(P["owner"])
         if owner and str(owner) in exclude_ids:               # owner ∉ {Stephanie}, empty OK

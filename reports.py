@@ -100,7 +100,7 @@ SUPPORT_ROSTER = [
     "Shivani Shaurya", "Phil Kolanowski", "Andrew Kirkham", "Ali Vahedi",
     "Adam Goldband", "Gabriel Tan",
 ]
-OWNER_EXCLUDE = ["Stephanie Hunter"]
+OWNER_EXCLUDE = []   # Stephanie Hunter exclusion removed 2026-11-05 — her tickets count again
 
 
 # ---------------------------------------------------------------------------

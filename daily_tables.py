@@ -1191,7 +1191,7 @@ def _people_tbl(title, w, o, oo, cols):
 
 _2B_ASSIGNEES = {"Batuhan Karabay", "Christian Alvarez", "Ryan Connon", "Shivani Shaurya",
                  "Phil Kolanowski", "Andrew Kirkham", "Ali Vahedi", "Adam Goldband", "Gabriel Tan"}
-_2B_OWNER_EXCLUDE = {"Stephanie Hunter"}
+_2B_OWNER_EXCLUDE = set()   # Stephanie Hunter exclusion removed 2026-11-05 — her tickets count again
 
 
 def _advisor_open_pending_action_2b(hs):

@@ -1195,7 +1195,8 @@ def _people_tbl(title, w, o, oo, cols):
 
 
 _2B_ASSIGNEES = {"Batuhan Karabay", "Christian Alvarez", "Ryan Connon", "Shivani Shaurya",
-                 "Phil Kolanowski", "Andrew Kirkham", "Ali Vahedi", "Adam Goldband", "Gabriel Tan"}
+                 "Phil Kolanowski", "Andrew Kirkham", "Ali Vahedi", "Adam Goldband", "Gabriel Tan",
+                 "Krishen Sihra"}   # Krishen added 2026-11-13 — HubSpot 2b counts his Pending Action tickets
 _2B_OWNER_EXCLUDE = set()   # Stephanie Hunter exclusion removed 2026-11-05 — her tickets count again
 
 
@@ -1259,10 +1260,21 @@ def _clarification_completed(hs):
     within, outside = {}, {}
     if not pid:
         return within, outside
+    # Candidates: current action item entered today, PLUS tickets HubSpot's step workflow stamped with a
+    # Clarification Completed Date today. (2026-11-13: HubSpot does NOT update date_entered_current_action_item
+    # when a ticket leaves Clarification Required, so the first search alone missed those exits.)
     cand = hs.search([{"propertyName": "hs_pipeline", "operator": "EQ", "value": pid},
                       {"propertyName": "date_entered_current_action_item", "operator": "GTE", "value": t0},
                       {"propertyName": "action_item", "operator": "NEQ", "value": reports.CLARIFICATION_AI}],
                      ["action_item"])
+    try:
+        seen = {str(r["id"]) for r in cand}
+        cand += [r for r in hs.search([{"propertyName": "hs_pipeline", "operator": "EQ", "value": pid},
+                                       {"propertyName": "clarification_completed_date", "operator": "GTE", "value": t0}],
+                                      ["action_item"])
+                 if str(r["id"]) not in seen]
+    except Exception as e:
+        print(f"[dash][WARN] Clarification candidates (completed-date search): {e}")
     if not cand:
         return within, outside
     id_to_name, name_to_id = hs.owner_maps()

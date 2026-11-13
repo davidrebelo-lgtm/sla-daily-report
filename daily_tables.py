@@ -467,16 +467,17 @@ def _cs_completed(hs):
                       {"propertyName": "closed_date", "operator": "GTE", "value": t0},
                       {"propertyName": "closed_date", "operator": "LT", "value": t1},
                       {"propertyName": "assigned_to_processing", "operator": "HAS_PROPERTY"}],
-                     ["overall_sla_within", "sla_status", "total_time_with_nbin", "assigned_to_processing"])
+                     ["overall_sla_within", "total_time_with_nbin", "assigned_to_processing", "action_item"])
     within, outside = {}, {}
     for p in rows:
+        # Same rules as HubSpot 4f / 4h (re-read 2026-11-13). sla_status is "N/A" on every ticket now, so the
+        # old sla_status test counted late tickets as BOTH within and outside.
+        if p.get("action_item") == "Cancelled":                              # 4f/4h: Action Item none of Cancelled
+            continue
         ov = (p.get("overall_sla_within") or "")
-        sla = p.get("sla_status")
-        sla_outside = (sla == "outside sla")
-        f_keep = not (ov == "false" and sla_outside)
-        nbin = to_num(p.get("total_time_with_nbin"))
-        c5 = (nbin is None) or (nbin <= 2)
-        h_keep = ((ov in ("false", "")) or sla_outside) and c5
+        nbin = to_num(p.get("total_time_with_nbin"))                       # stored in milliseconds
+        f_keep = (ov == "true")                                            # 4f: Overall SLA Within = true
+        h_keep = (ov == "false") and (nbin is None or nbin <= 2 * 86400000)  # 4h: = false AND NBIN <= 2 days or unknown
         attr = p.get("assigned_to_processing")
         if not attr or _is_owner(p, attr):
             continue
@@ -666,6 +667,7 @@ def _aa_report(hs, *, sla_value, date_mode, owner_checks, exclude_admin, total_t
 
 # ── Account Services "Outstanding Tickets that are Outside SLA" — report 5b (segment-driven snapshot) ────────
 _AA_COMPLETED_STAGE = "154789384"  # "Completed (Account Administration)" stage
+_ESTATE_SETTLEMENT_PIPELINE = "112255243"  # Estate tickets are counted in the Wills & Estates table, not here
 
 # 5b outside-SLA segments (HubSpot active lists), matched case-insensitively by keyword.
 _5B_SEGMENTS = {
@@ -705,7 +707,7 @@ def _acct_services_outside_5b(hs, missing=None):
     if not cand:
         return {}
     props = hs.batch_read(list(cand),
-                          ["request_type", "hs_pipeline_stage", "assigned_to",
+                          ["request_type", "hs_pipeline", "hs_pipeline_stage", "assigned_to",
                            "notification_sent_to_assignee", "sent_to_nbin__date__time"])
     id_to_name, _ = hs.owner_maps()
     counts = {}
@@ -721,7 +723,10 @@ def _acct_services_outside_5b(hs, missing=None):
         b = to_ms(p.get("sent_to_nbin__date__time"))
         c3 = (a is not None and b is not None and int((b - a) / 60000) > 15)
         # (1 AND 2) OR (1 AND 3 AND 4)  — clause 1 already enforced above
-        if (tid in branch2) or (c3 and tid in branch4):
+        # HubSpot 5b group 2 also has "Pipeline is none of Estate Settlement" (added 2026-11-12) so estate
+        # tickets are not double counted here and in the Wills & Estates table.
+        in_branch2 = tid in branch2 and str(p.get("hs_pipeline")) != _ESTATE_SETTLEMENT_PIPELINE
+        if in_branch2 or (c3 and tid in branch4):
             attr = p.get("assigned_to")
             if not attr or _is_owner(p, attr):
                 continue

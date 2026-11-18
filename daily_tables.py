@@ -10,6 +10,7 @@ build_tables(hs) -> ordered list of table dicts matching the daily SLA email:
 import datetime as _dt
 
 import reports
+import stamp
 from hubspot_client import to_ms, to_num, today_bounds_ms, TZ
 
 # Test/demo owners to exclude from every people table (they aren't real reps).
@@ -19,7 +20,7 @@ _EXCLUDE_NAMES = {"Transition Demo", "Optimize Administrator",
 _EXCLUDE_BY_TITLE = {
     "Client Service Dashboard": {"Rohit Kapoor"},
     "Transfers (Pending Review)": {"Rohit Kapoor", "Srijan Ahuja", "Jay Suba"},
-    "Account Services Dashboard": {"Rashi Tiwari"},
+    "Account Services Dashboard": {"Rashi Tiwari", "Nicholas Stavropoulos"},   # Nicholas removed 2026-11-18 (Ryan's note)
     "Advisor Support Dashboard": {"Michael McLaren", "Steven McMackon", "Darcy Lillie"},
 }
 
@@ -732,6 +733,7 @@ def _acct_services_outside_5b(hs, missing=None):
                 continue
             nm = id_to_name.get(str(attr), str(attr))
             counts[nm] = counts.get(nm, 0) + 1
+            stamp.record(hs, "Account Services", tid, attr, nm)   # → HubSpot reports 5(a) / 5(b)
     return counts
 
 
@@ -939,6 +941,7 @@ def _aa_amendments_required(hs):
         if _business_seconds(entry, now_ms) > _AMEND_SLA_SECONDS:
             nm = id_to_name.get(str(aid), str(aid))
             open_outside[nm] = open_outside.get(nm, 0) + 1
+            stamp.record(hs, "Account Services", tid, aid, nm)    # → HubSpot reports 5(a) / 5(b)
     return {}, {}, open_outside
 
 
@@ -965,7 +968,8 @@ _AA_FINAL_REVIEW_FALLBACK_SLA_MIN = 2 * 60   # 2 business hours — the SLA HubS
 
 
 def _step_leg(hs, *, pipelines, steps, request_types=None, fallback_sla_min=None, include_open=True,
-              exclude_open_ids=frozenset(), credit_fallback_prop=None, label="", errors=None):
+              exclude_open_ids=frozenset(), credit_fallback_prop=None, label="", errors=None,
+              stamp_section=None):
     """(within, outside, open_outside, unclassified) for one action-item step, credited by Assigned to.
       open_outside   = tickets in the step now whose due has passed (only if include_open).
       within/outside = tickets that LEFT the step today (Toronto); exit <= due → within.
@@ -980,9 +984,10 @@ def _step_leg(hs, *, pipelines, steps, request_types=None, fallback_sla_min=None
 
     def credit(d, aid, p):
         if not aid or _is_owner(p, aid) or str(aid) == _OPT_ADMIN_ID:
-            return
+            return None
         nm = id_to_name.get(str(aid), str(aid))
         d[nm] = d.get(nm, 0) + 1
+        return nm
 
     base = [{"propertyName": "hs_pipeline", "operator": "IN", "values": list(pipelines)}]
     if request_types:
@@ -1002,9 +1007,13 @@ def _step_leg(hs, *, pipelines, steps, request_types=None, fallback_sla_min=None
                     unclassified += 1
                     continue
                 if now_ms > due:
-                    credit(open_outside, r.get("assigned_to"), r)
+                    nm = credit(open_outside, r.get("assigned_to"), r)
+                    if nm and stamp_section:                      # → HubSpot reports (see stamp.py)
+                        stamp.record(hs, stamp_section, r["id"], r.get("assigned_to"), nm)
         except Exception as e:
             errors.append(f"{label} open: {e}")
+            if stamp_section:
+                stamp.mark_failed(hs, stamp_section)
 
     try:
         extra = [credit_fallback_prop] if credit_fallback_prop else []
@@ -1063,20 +1072,25 @@ def _account_services(hs):
         except Exception as e:
             print(f"[dash][WARN] Account Services {label}: {e}")
             notes.append(f"{label} unavailable: {str(e)[:120]}")
+            if label.startswith("Outstanding"):
+                stamp.mark_failed(hs, "Account Services")
     if missing:
+        stamp.mark_failed(hs, "Account Services")     # a segment wasn't found → don't trust this run's stamps
         notes.append("segment(s) not found, counted as 0: " + ", ".join(missing))
     try:
         a_within, a_outside, a_open = _aa_amendments_required(hs)      # + Amendments Required SLA leg
         add(within, a_within); add(outside, a_outside); add(open_outside, a_open)
     except Exception as e:
         print(f"[dash][WARN] Account Services Amendments Required: {e}")
+        stamp.mark_failed(hs, "Account Services")
         notes.append(f"Amendments Required unavailable: {str(e)[:120]}")
     fr_err = []                                                        # + AA Final Review leg (off by default)
     if _AA_FINAL_REVIEW_ENABLED:
         fr_w, fr_o, fr_open, _ = _step_leg(hs, pipelines=[_AA_PIPELINE_ID], steps=_AA_FINAL_REVIEW_STEPS,
                                            request_types=_AA_FINAL_REVIEW_REQ_TYPES,
                                            fallback_sla_min=_AA_FINAL_REVIEW_FALLBACK_SLA_MIN,
-                                           label="AA Final Review", errors=fr_err)
+                                           label="AA Final Review", errors=fr_err,
+                                           stamp_section="Account Services")
         add(within, fr_w); add(outside, fr_o); add(open_outside, fr_open)
     if fr_err:
         notes.append("Final Review leg partly unavailable: " + "; ".join(fr_err)[:150])
@@ -1221,7 +1235,7 @@ def _advisor_open_pending_action_2b(hs):
                           ["action_item", "hs_pipeline_stage", "assigned_to", "hubspot_owner_id",
                            "request_submitted_by", "ticket_opened_after_530"])
     counts = {}
-    for p in props.values():
+    for tid, p in props.items():
         if p.get("action_item") != "Pending Action":                          # filter 1
             continue
         if str(p.get("hs_pipeline_stage")) == str(closed):                     # filter 2
@@ -1239,6 +1253,7 @@ def _advisor_open_pending_action_2b(hs):
         if oa is not None and oa >= yest_ms:
             continue
         counts[nm] = counts.get(nm, 0) + 1
+        stamp.record_pa_open(hs, tid, nm)                                     # → HubSpot report 2(b)
     return counts
 
 
@@ -1307,11 +1322,26 @@ def _clarification_completed(hs):
             nm = id_to_name.get(str(aid), str(aid))
             d = within if t_out <= due else outside
             d[nm] = d.get(nm, 0) + 1
+            stamp.record_today(hs, reports.CLARIFICATION_AI, tid, nm, t_out <= due)   # → 2(p) / 2(q)
     return within, outside
 
 
+def _today_legs_stamped(hs, within):
+    """Same as reports.build_today(hs, within), but also labels each ticket in HubSpot per step
+    (see stamp.py) so reports 2(k)-2(n) and the PA-today report count exactly these tickets."""
+    id_to_name, _ = hs.owner_maps()
+    legs = [("Pending Action", reports._today_pending_action(hs, within)),
+            ("In Process", reports._today_in_process(hs, within)),
+            ("Pending Confirmation", reports._today_pending_conf(hs, within))]
+    for step, res in legs:
+        for tid, oid in res.items():
+            if oid:
+                stamp.record_today(hs, step, tid, id_to_name.get(str(oid), str(oid)), within)
+    return reports._sum_per_person(hs, [r for _, r in legs])
+
+
 def _advisor_dashboard(hs):
-    within, outside = reports.build_today(hs, True), reports.build_today(hs, False)
+    within, outside = _today_legs_stamped(hs, True), _today_legs_stamped(hs, False)
     note = None
     try:                                         # + Clarification Required completed today
         c_w, c_o = _clarification_completed(hs)
@@ -1320,6 +1350,7 @@ def _advisor_dashboard(hs):
                 dst[k] = dst.get(k, 0) + v
     except Exception as e:
         print(f"[dash][WARN] Clarification Required leg: {e}")
+        stamp.mark_failed(hs, "Advisor Support")      # don't write half a day of labels
         note = f"(Clarification Required completed counts unavailable: {str(e)[:200]})"
     t = _people_tbl("Advisor Support Dashboard", within, outside,
                     reports.build_open_outside(hs), _ADVISOR_COLS)
@@ -1352,6 +1383,11 @@ def build_tables(hs):
         try:
             tables.append(fn(hs))
         except Exception as e:
+            for sec, sec_title in stamp.SECTIONS.items():
+                if sec_title == title:
+                    stamp.mark_failed(hs, sec)
+            if title.startswith("Advisor Support (Pending Action)"):   # feeds report 2(b) labels
+                stamp.mark_failed(hs, "Advisor Support")
             tables.append({"title": title, "columns": cols, "rows": [],
                            "total": (["Total"] + [0] * (len(cols) - 1)) if "Name" in cols else None,
                            "flat_row": ([0] * len(cols)) if "Name" not in cols else None,
@@ -1374,3 +1410,9 @@ def build_tables(hs):
             ncol = len(t["columns"])
             t["total"] = ["Total"] + [sum(r[i] for r in kept) for i in range(1, ncol)]
     return tables
+
+
+def stamp_hubspot(hs):
+    """After build_tables(hs): write this run's Outstanding-Outside-SLA tickets back to HubSpot
+    (see stamp.py). Same name exclusions as the tables, so the HubSpot reports match exactly."""
+    return stamp.push(hs, _EXCLUDE_NAMES, _EXCLUDE_BY_TITLE)

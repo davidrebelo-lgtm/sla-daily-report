@@ -14,6 +14,7 @@ import sys
 import time
 
 from hubspot_client import HubSpot, P, days_ago_ms, today_bounds_ms, to_ms, to_num
+import stamp
 
 
 def _datediff_minutes(rows, a_key, b_key):
@@ -160,6 +161,8 @@ def build_open_outside(hs: HubSpot):
             continue
         name = id_to_name.get(str(a), str(a))
         counts[name] = counts.get(name, 0) + 1
+        stamp.record(hs, "Advisor Support", tid, a, name,      # → HubSpot reports 2(a) / 2(o) / 2(c) / 2(d)
+                     step=p.get(P["action_item"]))
     return counts
 
 

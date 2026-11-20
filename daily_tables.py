@@ -920,7 +920,8 @@ def _aa_amendments_required(hs):
 
     open_ids = [str(r["id"]) for r in hs.search(
         [{"propertyName": "hs_pipeline", "operator": "EQ", "value": _AA_PIPELINE_ID},
-         {"propertyName": "action_item", "operator": "EQ", "value": _AMEND_AI}],
+         {"propertyName": "action_item", "operator": "EQ", "value": _AMEND_AI},
+         {"propertyName": "hs_pipeline_stage", "operator": "NEQ", "value": _AA_COMPLETED_STAGE}],   # skip Completed (2026-11-20)
         ["hs_pipeline"])]
     if not open_ids:
         return {}, {}, {}
@@ -969,7 +970,7 @@ _AA_FINAL_REVIEW_FALLBACK_SLA_MIN = 2 * 60   # 2 business hours — the SLA HubS
 
 def _step_leg(hs, *, pipelines, steps, request_types=None, fallback_sla_min=None, include_open=True,
               exclude_open_ids=frozenset(), credit_fallback_prop=None, label="", errors=None,
-              stamp_section=None):
+              stamp_section=None, exclude_open_stages=()):
     """(within, outside, open_outside, unclassified) for one action-item step, credited by Assigned to.
       open_outside   = tickets in the step now whose due has passed (only if include_open).
       within/outside = tickets that LEFT the step today (Toronto); exit <= due → within.
@@ -995,7 +996,11 @@ def _step_leg(hs, *, pipelines, steps, request_types=None, fallback_sla_min=None
 
     if include_open:
         try:
-            for r in hs.search(base + [{"propertyName": "action_item", "operator": "IN", "values": list(steps)}],
+            open_filters = base + [{"propertyName": "action_item", "operator": "IN", "values": list(steps)}]
+            if exclude_open_stages:   # closed/completed tickets whose Action Item was never moved are NOT outstanding
+                open_filters.append({"propertyName": "hs_pipeline_stage", "operator": "NOT_IN",
+                                     "values": list(exclude_open_stages)})
+            for r in hs.search(open_filters,
                                ["sla_due_date", "action_item_sla", "date_entered_current_action_item"]):
                 if str(r["id"]) in exclude_open_ids:
                     continue
@@ -1090,7 +1095,8 @@ def _account_services(hs):
                                            request_types=_AA_FINAL_REVIEW_REQ_TYPES,
                                            fallback_sla_min=_AA_FINAL_REVIEW_FALLBACK_SLA_MIN,
                                            label="AA Final Review", errors=fr_err,
-                                           stamp_section="Account Services")
+                                           stamp_section="Account Services",
+                                           exclude_open_stages=[_AA_COMPLETED_STAGE])   # skip Completed tickets (2026-11-20)
         add(within, fr_w); add(outside, fr_o); add(open_outside, fr_open)
     if fr_err:
         notes.append("Final Review leg partly unavailable: " + "; ".join(fr_err)[:150])
